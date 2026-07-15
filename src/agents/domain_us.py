@@ -93,13 +93,19 @@ def _extract_ticker_token(question: str) -> str | None:
     """질문에 이미 티커 형태(AAPL, BRK.B 등)로 들어있는 토큰을 찾는다.
 
     PER/RSI처럼 티커 형식과 겹치는 지표 키워드는 _NON_TICKER_KEYWORDS로 제외한다.
+    원본 토큰이 이미 전부 대문자일 때만 "사용자가 실제로 티커를 입력했다"고 인정한다 —
+    소문자 회사명(예: "nvidia", 6글자)이 대문자 변환 후 티커 형식 정규식과 우연히
+    길이가 맞아떨어져 즉시 채택돼버리면, 뒤에 있는 진짜 회사명→티커 변환 단계
+    (resolve_ticker_us의 llm_fn/us_company 조회)를 건너뛰어 매번 결정론적으로
+    실패한다(실서버 재현: "현재 nvidia 주식 주가" → stock_code="NVIDIA").
     """
     for token in re.findall(r"[A-Za-z][A-Za-z.]{0,6}", question):
-        upper = token.upper()
-        if upper in _NON_TICKER_KEYWORDS:
+        if not token.isupper():
             continue
-        if _TICKER_RE.match(upper):
-            return upper
+        if token in _NON_TICKER_KEYWORDS:
+            continue
+        if _TICKER_RE.match(token):
+            return token
     return None
 
 
@@ -119,6 +125,22 @@ def _lookup_ticker_by_name(conn, name_fragment: str, execute_sql_fn: Callable | 
     return result["rows"][0]["stock_code"]
 
 
+def _ticker_prompt(question: str) -> str:
+    """resolve_ticker_us의 llm_fn 폴백용 프롬프트. _intent_prompt(domain_kr)와 동일 관례.
+
+    llm_fn(question)처럼 원본 질문을 그대로 넘기면 LLM이 챗봇처럼 장문으로 답해버려
+    (실측 확인: role="sql" 모델에 "앤비디아 주식 주가"를 그대로 넣으면 "저는 실시간
+    시세를 직접 조회할 수는 없습니다..." 같은 설명문이 돌아옴) 뒤에서 티커를 못 뽑아
+    매번 실패했다. "티커만 답하라"는 지시를 명시해야 한다.
+    """
+    return (
+        "다음 질문에서 언급된 회사의 미국 주식시장 티커 심볼(예: AAPL, NVDA, MSFT)만 답하세요.\n"
+        "설명이나 다른 말은 절대 덧붙이지 말고, 티커 심볼 하나만 출력하세요.\n"
+        "확실하지 않으면 'UNKNOWN'이라고만 답하세요.\n\n"
+        f"질문: {question}\n티커:"
+    )
+
+
 def resolve_ticker_us(
     question: str,
     conn,
@@ -127,17 +149,37 @@ def resolve_ticker_us(
 ) -> str | None:
     """질문에서 미국 티커를 추출한다.
 
-    순서: (1) 질문에 이미 티커 형태 토큰이 있으면 즉시 채택 → (2) llm_fn(question)
-    폴백(한글 회사명 등 규칙기반으로 못 찾는 경우, HA-2 classify_source와 동일한
-    DI 패턴) → (2)의 결과가 티커 형식이면 그대로, 아니면 us_company.name으로 재조회.
-    끝까지 못 찾으면 None(호출부가 실패로 처리).
+    순서: (1) 질문에 이미 티커 형태 토큰이 있으면 즉시 채택 → (2) llm_fn(_ticker_prompt(...))
+    폴백(한글 회사명 등 규칙기반으로 못 찾는 경우, HA-2 classify_source와 동일한 DI 패턴)
+    → (2)의 결과가 티커 형식이면 그대로, 아니면 us_company.name으로 재조회 → 그래도
+    못 찾으면(LLM이 프롬프트 지시를 어기고 부연설명을 붙인 경우) 응답 텍스트 안에서
+    티커형 토큰을 뽑아 다시 회사명/형식 순으로 시도한다. 끝까지 못 찾으면 None(호출부가
+    실패로 처리).
     """
     token = _extract_ticker_token(question)
     if token:
         return token
     if llm_fn is None:
         return None
-    guess = llm_fn(question)
+    guess = llm_fn(_ticker_prompt(question))
+    ticker = _resolve_from_llm_guess(guess, conn, execute_sql_fn=execute_sql_fn)
+    if ticker:
+        return ticker
+    # 방어적 재시도: 프롬프트 지시를 어기고 부연설명이 붙은 응답(예: "티커: **NVDA**")에서
+    # 티커형 토큰을 뽑아 같은 순서(회사명 조회 → 형식 매치)로 한 번 더 시도한다.
+    candidate = _extract_ticker_token(guess or "")
+    if candidate:
+        return _resolve_from_llm_guess(candidate, conn, execute_sql_fn=execute_sql_fn)
+    return None
+
+
+def _resolve_from_llm_guess(
+    guess: str | None, conn, execute_sql_fn: Callable | None = None
+) -> str | None:
+    """llm_fn 추측 하나를 회사명 조회 → 티커 형식 매치 순으로 티커로 확정 시도한다."""
+    if not guess:
+        return None
+    guess = guess.strip()
     if not guess:
         return None
     # 회사명 조회를 먼저 시도한다 — 짧은 회사명(예: "Apple")은 티커 형식 정규식과 우연히
@@ -146,7 +188,7 @@ def resolve_ticker_us(
     by_name = _lookup_ticker_by_name(conn, guess, execute_sql_fn=execute_sql_fn)
     if by_name:
         return by_name
-    guess_upper = guess.strip().upper()
+    guess_upper = guess.upper()
     if _TICKER_RE.match(guess_upper):
         return guess_upper
     return None

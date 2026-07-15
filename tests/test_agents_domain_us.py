@@ -18,6 +18,7 @@ from __future__ import annotations
 from src.agents.domain_us import (
     _call_with_retry,
     _classify_intent,
+    _extract_ticker_token,
     _filter_common_stock,
     _is_common_stock_by_name_fallback,
     answer_us_question,
@@ -198,13 +199,20 @@ def test_resolve_ticker_us_does_not_mistake_financial_keyword_for_ticker(tmp_pat
 
 
 def test_resolve_ticker_us_falls_back_to_llm_for_korean_company_name(tmp_path):
-    """'애플' 같은 한글 회사명은 규칙기반으로 못 찾으므로 llm_fn 폴백에 위임한다."""
+    """'애플' 같은 한글 회사명은 규칙기반으로 못 찾으므로 llm_fn 폴백에 위임한다.
+
+    llm_fn에는 원본 질문을 그대로 넘기면 안 된다 — 실측 확인: 원문("앤비디아 주식
+    주가")을 role="sql" LLM에 그대로 넘기면 "저는 실시간 시세를 조회할 수 없습니다..."
+    같은 장문 챗봇 답변이 오고, 그 안에서 회사명/티커를 못 뽑아내 매번 실패했다
+    (son-checker류 재현 아님, 실서버 직접 재현: "앤비디아 주식 주가" → error).
+    반드시 "티커만 답하라"는 지시가 포함된 프롬프트로 감싸 호출해야 한다.
+    """
     db = _seed_us_db(tmp_path)
     conn = connect_readonly(db)
     calls = []
 
-    def fake_llm(question):
-        calls.append(question)
+    def fake_llm(prompt):
+        calls.append(prompt)
         return "AAPL"
 
     try:
@@ -212,7 +220,9 @@ def test_resolve_ticker_us_falls_back_to_llm_for_korean_company_name(tmp_path):
     finally:
         conn.close()
     assert ticker == "AAPL"
-    assert calls == ["애플 주가 알려줘"]
+    assert len(calls) == 1
+    assert "애플 주가 알려줘" in calls[0]
+    assert "티커" in calls[0]
 
 
 def test_resolve_ticker_us_resolves_llm_company_name_guess_via_us_company_table(tmp_path):
@@ -228,6 +238,66 @@ def test_resolve_ticker_us_resolves_llm_company_name_guess_via_us_company_table(
     finally:
         conn.close()
     assert ticker == "AAPL"
+
+
+def test_extract_ticker_token_does_not_mistake_lowercase_company_name_for_ticker():
+    """'nvidia'(6글자)는 티커 형식 정규식(대문자 1~6글자)과 우연히 길이가 맞아,
+    소문자로 써도 upper() 변환 후 '이미 티커'로 오판되던 버그(재현: 실서버에서
+    "현재 nvidia 주식 주가"가 stock_code='NVIDIA'로 조회돼 매 시도 실패).
+    사용자가 실제로 대문자 티커를 입력했을 때만(예: AAPL) 채택해야 한다."""
+    assert _extract_ticker_token("현재 nvidia 주식 주가") is None
+
+
+def test_extract_ticker_token_still_accepts_uppercase_ticker_in_question():
+    assert _extract_ticker_token("AAPL 주가 알려줘") == "AAPL"
+
+
+def test_resolve_ticker_us_falls_back_to_llm_for_lowercase_company_name(tmp_path):
+    """소문자 회사명(nvidia)은 규칙기반 즉시채택 없이 llm_fn 폴백으로 넘어가야 한다."""
+    db = _seed_us_db(tmp_path)
+    conn = connect_readonly(db)
+    calls = []
+
+    def fake_llm(prompt):
+        calls.append(prompt)
+        return "NVDA"
+
+    try:
+        ticker = resolve_ticker_us("현재 nvidia 주식 주가", conn, llm_fn=fake_llm)
+    finally:
+        conn.close()
+    assert ticker == "NVDA"
+    assert len(calls) == 1
+    assert "현재 nvidia 주식 주가" in calls[0]
+
+
+def test_resolve_ticker_us_extracts_ticker_from_verbose_llm_response(tmp_path):
+    """LLM이 프롬프트 지시를 어기고 부연설명을 붙여도(실측 재현: role=sql 모델에 원문을
+    그대로 넣었을 때 실제로 나온 응답 "엔비디아(NVIDIA, 티커: **NVDA**) 주가를
+    말씀하시는 거라면, 저는 실시간 시세를 직접 조회할 수는 없습니다...") 그 안에 있는
+    진짜 티커를 최종적으로 뽑아낼 수 있어야 한다(방어적 파싱 — 프롬프트 개선만 믿지 않음)."""
+    db = _seed_us_db(tmp_path)
+    seed_conn = connect(db)
+    seed_conn.execute(
+        "INSERT INTO us_company(stock_code, name, exchange, sector, market_cap, updated_at) "
+        "VALUES (?,?,?,?,?,?)",
+        ("NVDA", "NVIDIA Corporation Common Stock", "NASDAQ", "Technology", 3.5e12, "2026-07-01"),
+    )
+    seed_conn.commit()
+    seed_conn.close()
+    conn = connect_readonly(db)
+
+    def verbose_llm(prompt):
+        return (
+            "엔비디아(NVIDIA, 티커: **NVDA**) 주가를 말씀하시는 거라면, "
+            "저는 실시간 시세를 직접 조회할 수는 없습니다."
+        )
+
+    try:
+        ticker = resolve_ticker_us("현재 nvidia 주식 주가", conn, llm_fn=verbose_llm)
+    finally:
+        conn.close()
+    assert ticker == "NVDA"
 
 
 def test_resolve_ticker_us_returns_none_when_unresolvable(tmp_path):
