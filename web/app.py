@@ -348,7 +348,7 @@ def api_macro():
         "fetched_at": fetched_at,
         "usdkrw": usdkrw,
         "indices": indices,
-        "note": {"quotes": "코스피/코스닥은 장마감 확정치, 해외지수는 약 15-20분 지연"},
+        "note": {"quotes": "코스피/코스닥은 네이버 실시간 시세(장중 실시간·장마감 후 확정치), 해외지수는 약 15-20분 지연"},
     }
 
 
