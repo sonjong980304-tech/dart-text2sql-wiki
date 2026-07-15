@@ -364,6 +364,33 @@ def verify_answer(
             "per_domain": {d: {"valid": True, "reason": reason} for d in domain_results},
         }
 
+    # 복합 도메인(2개 이상)이면 먼저 전체 도메인 결과를 한 번에 합산 검증한다. 질문이
+    # 여러 도메인에 나눠 걸쳐 있으면(예: "SK하이닉스 10년 골든크로스 전략" → kr(종가)+
+    # backtest(수익률)) 각 도메인은 질문의 "자기 몫"만 정상 수행해도 되는데, 도메인
+    # 하나만 떼어 전체 질문 기준으로 판정하면 "이 도메인 혼자서는 질문을 다 못 채운다"는
+    # 이유로 결정론적으로(재시도해도 절대 안 고쳐짐) 매번 실패한다(실서버 재현 버그).
+    # 합산 검증이 통과하면 그걸로 끝 — 도메인별 개별 호출로 낭비하지 않는다.
+    if len(domain_results) > 1:
+        try:
+            joint_raw = llm_fn(_verify_prompt(question, domain_results)) or ""
+            joint_verdict = _parse_verdict(joint_raw)
+        except Exception as exc:  # noqa: BLE001 — 검증 불가로 구분(위 단일도메인 분기와 동일 원칙)
+            joint_verdict = {
+                "valid": True,
+                "reason": f"검증 불가(LLM 장애: {type(exc).__name__}) — 데이터 존재 확인만으로 통과시킴.",
+                "verification_unavailable": True,
+            }
+        if joint_verdict["valid"]:
+            verdict = {
+                "valid": True, "reason": joint_verdict["reason"],
+                "per_domain": {d: dict(joint_verdict) for d in domain_results},
+            }
+            if joint_verdict.get("verification_unavailable"):
+                verdict["verification_unavailable"] = True
+            return verdict
+        # 합산 검증이 실제로 실패하면(진짜 문제) 아래에서 도메인별로 세분화해 원인을
+        # 특정한다 — 실패한 도메인만 부분 재-dispatch할 수 있도록.
+
     # 도메인별로 개별 판정한다 — 복합 도메인 질문(kr+us 등)에서 일부 도메인만 검증에
     # 실패해도 그 도메인만 부분 재-dispatch할 수 있도록(answer_with_verification이 이
     # per_domain을 읽어 실패한 도메인만 재시도한다. 이미 통과한 도메인을 매번 다시

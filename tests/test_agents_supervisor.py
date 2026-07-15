@@ -864,7 +864,84 @@ def test_domain_has_data_returns_false_when_all_entities_empty():
     assert supervisor_mod._domain_has_data(kr_result) is False
 
 
-def test_verify_answer_multi_entity_kr_result_passes_deterministic_check():
+# ── 복합 도메인(kr+backtest 등) 검증 — 도메인 하나가 전체 질문을 혼자 못 채운다는
+#    이유만으로 부당하게 실패 처리되지 않아야 한다 ────────────────────────────────
+# 실서버 재현 버그: "SK하이닉스 최근 10년 골든크로스 전략 수익률과 그래프"가 kr+backtest
+# 두 도메인으로 라우팅됨. backtest 도메인은 실제로 10년치를 정확히 계산해 반환했지만,
+# kr 도메인(단순 종가 조회, 자기 몫만 정상 수행)이 "전체 질문"(백테스트 수익률/그래프 포함)
+# 을 혼자 못 채운다는 이유로 검증에 실패 처리됐다. per_domain 검증이 각 도메인을 "전체
+# 질문에 혼자 답해야 한다"는 기준으로 판정했기 때문 — 도메인끼리 서로 다른 부분을 나눠
+# 담당하는 복합 질문에서는 항상, 결정론적으로(재시도해도 안 고쳐짐) 실패한다.
+
+def test_verify_answer_composite_domains_pass_when_combined_result_satisfies_question():
+    """kr(종가)+backtest(수익률) 각자 자기 몫만 답해도, 합쳐서 질문을 만족하면 전체 유효해야 한다."""
+    domain_results = {
+        "kr": {"stock_code": "000660", "financial": None,
+               "price": [{"close": 2082000.0}], "errors": []},
+        "backtest": {"blocked": False, "error": None,
+                     "result": {"dates": ["2016-07-18", "2026-07-15"], "navs": [1.0, 11.6],
+                                "performance": {"cagr": 28.66, "total_return": 1058.8}},
+                     "hard": [], "warnings": [], "data": []},
+    }
+    calls: list[dict] = []
+
+    def fake_llm(prompt: str) -> str:
+        # 도메인이 몇 개 언급됐는지로 "합산 검증" 호출인지 "도메인별 개별" 호출인지 구분한다.
+        mentions = sum(1 for d in ("\"kr\"", "\"backtest\"") if d in prompt)
+        calls.append({"mentions": mentions})
+        if mentions == 2:
+            return '{"valid": true, "reason": "kr은 종가, backtest는 10년 수익률을 각각 답해 합쳐서 질문을 만족함"}'
+        # 도메인 하나만 놓고 보면(예전 버그 재현) 늘 불일치로 나온다고 가정.
+        return '{"valid": false, "reason": "이 도메인 결과만으로는 질문 전체에 답하지 못함"}'
+
+    verdict = verify_answer(
+        "SK하이닉스 최근 10년간 10일선/20일선 교차 매매전략 수익률과 그래프 알려줘",
+        domain_results, fake_llm,
+    )
+
+    assert verdict["valid"] is True
+    assert len(calls) == 1  # 합산 검증 1회로 끝남 — 도메인별 개별 호출로 새지 않음
+    assert all(v["valid"] for v in verdict["per_domain"].values())
+
+
+def test_verify_answer_composite_domains_falls_back_to_per_domain_when_combined_check_fails():
+    """합산 검증이 실제로 실패하면(진짜 문제) 기존처럼 도메인별로 세분화해 원인을 특정한다."""
+    domain_results = {
+        "kr": {"stock_code": "005930", "financial": {"value": 12.5}, "price": None, "errors": []},
+        "us": {"stock_code": "WRONG", "financial": {"value": 999.0}, "price": None, "errors": []},
+    }
+
+    def fake_llm(prompt: str) -> str:
+        mentions = sum(1 for d in ("\"kr\"", "\"us\"") if d in prompt)
+        if mentions == 2:
+            return '{"valid": false, "reason": "us 결과의 종목이 질문과 다름"}'
+        if '"us"' in prompt:
+            return '{"valid": false, "reason": "us: 종목 불일치"}'
+        return '{"valid": true, "reason": "kr: 일치"}'
+
+    verdict = verify_answer("삼성전자와 엔비디아 PER 비교", domain_results, fake_llm)
+
+    assert verdict["valid"] is False
+    assert verdict["per_domain"]["kr"]["valid"] is True
+    assert verdict["per_domain"]["us"]["valid"] is False
+
+
+def test_verify_answer_single_domain_question_calls_llm_exactly_once():
+    """회귀 방지: 단일 도메인 질문은 합산 검증 도입 전과 동일하게 LLM 호출 1회만 한다."""
+    calls: list[str] = []
+
+    def fake_llm(prompt: str) -> str:
+        calls.append(prompt)
+        return "일치"
+
+    domain_results = {"kr": {"stock_code": "005930", "financial": {"value": 12.5}}}
+    verdict = verify_answer("삼성전자 PER 알려줘", domain_results, fake_llm)
+
+    assert len(calls) == 1
+    assert verdict["valid"] is True
+
+
+def test_domain_has_data_recognizes_multi_entity_kr_result_with_price():
     """실제 버그 재현: entities 데이터가 있으면 llm_fn=None 결정론 경로에서 통과해야 한다."""
     domain_results = {
         "kr": {
