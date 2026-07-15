@@ -130,15 +130,20 @@ def _extract_domains(text: str) -> list[str]:
 
 
 def _route_heuristic(question: str) -> list[str]:
-    """llm_fn 미가용 시 키워드 기반 라우팅. 아무것도 안 걸리면 ["kr"]로 폴백."""
+    """llm_fn 미가용 시 키워드 기반 라우팅. 아무것도 안 걸리면 빈 리스트(unknown)를 반환한다.
+
+    예전엔 아무것도 안 걸리면 무조건 ["kr"]로 폴백했는데, 그러면 완전히 무관한 질문("오늘
+    날씨 어때")까지 한국주식 조회로 이어졌다. 빈 리스트를 반환하면 answer_with_verification이
+    이를 "질문을 이해하지 못함"으로 즉시 처리한다. "삼성" 같은 실제 키워드가 있는 질문은
+    이 폴백과 무관하게 정상적으로 매치되어 영향받지 않는다.
+    """
     q = (question or "").lower()
     found = {
         domain
         for domain, keywords in _ROUTE_KEYWORDS.items()
         if any(kw.lower() in q for kw in keywords)
     }
-    routes = [d for d in _DOMAINS if d in found]
-    return routes or ["kr"]
+    return [d for d in _DOMAINS if d in found]
 
 
 def wants_chart(question: str) -> bool:
@@ -575,6 +580,19 @@ def answer_with_verification(
     progress_kwargs = {"on_progress": on_progress} if on_progress else {}
 
     routes = route_fn(question, llm_fn, **progress_kwargs)
+    if not routes:
+        # 라우팅이 도메인을 하나도 못 찾음(unknown) — dispatch/verify를 시도하는 낭비 없이
+        # 즉시 불확실 응답으로 끝낸다(완전히 무관한 질문에 억지로 도메인을 갖다붙이지 않는다).
+        if on_progress:
+            on_progress("supervisor", "질문을 이해하지 못했습니다 — 처리 가능한 도메인을 찾지 못함")
+        return {
+            "uncertain": True,
+            "reason": "질문을 이해하지 못했습니다. 국내/미국 주식, 매크로 지표, 백테스트 중 "
+                      "어떤 것에 대한 질문인지 좀 더 구체적으로 말씀해 주세요.",
+            "attempts": 0,
+            "domain_results": {},
+            "routes": [],
+        }
 
     domain_results: dict = {}
     last_reason: str | None = None

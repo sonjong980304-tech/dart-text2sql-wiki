@@ -70,8 +70,16 @@ def test_route_question_fallback_without_llm_detects_macro():
 
 
 def test_route_question_fallback_defaults_to_kr():
-    """휴리스틱으로도 판단 불가한 한국주식형 질문은 안전하게 ['kr']로 폴백."""
+    """'삼성' 키워드가 실제로 kr에 매치되어 감지된다(폴백이 아니라 정상 키워드 매치)."""
     assert route_question("삼성전자 PER 알려줘", None) == ["kr"]
+
+
+def test_route_question_fallback_returns_empty_for_completely_unrelated_question():
+    """휴리스틱 키워드 사전에 전혀 안 걸리는 질문(LLM도 없을 때)은 무조건 ['kr']로
+    폴백하지 않고 빈 리스트(unknown)를 반환해야 한다 — 무관한 질문에 한국주식을 억지로
+    갖다붙이지 않기 위함(실측 확인: '삼성' 같은 실제 키워드가 있는 질문은 이 폴백이 아니라
+    정상 매치 경로를 타므로 영향받지 않는다)."""
+    assert route_question("완전히 무관한 아무말 대잔치 질문입니다", None) == []
 
 
 # ── dispatch_domains — 각 도메인 원본 결과를 가공 없이 보존 ────────────────────
@@ -766,6 +774,28 @@ def test_answer_with_verification_retries_only_failed_domain_in_composite_questi
     assert res["attempts"] == 2
     assert res["domain_results"]["kr"]["stock_code"] == "005930"  # kr은 1차 결과 그대로 유지
     assert res["domain_results"]["us"]["stock_code"] == "NVDA"
+
+
+def test_answer_with_verification_returns_uncertain_immediately_when_routes_empty():
+    """라우팅 결과가 빈 리스트(unknown)면 dispatch/verify를 시도조차 하지 않고 즉시
+    '질문을 이해하지 못했습니다' 불확실 응답을 반환한다(불필요한 재시도 낭비 방지)."""
+    dispatch_calls: list[int] = []
+
+    def stub_route(question, llm_fn):
+        return []
+
+    def stub_dispatch(routes, question, conn, llm_fn, steps=None):
+        dispatch_calls.append(1)
+        return {}
+
+    res = answer_with_verification(
+        "완전히 무관한 질문", conn=None, llm_fn=None,
+        route_fn=stub_route, dispatch_fn=stub_dispatch,
+    )
+    assert dispatch_calls == []  # dispatch 자체가 호출되면 안 됨
+    assert res["uncertain"] is True
+    assert res["routes"] == []
+    assert res["attempts"] == 0
 
 
 def test_answer_with_verification_without_on_progress_is_unaffected():
