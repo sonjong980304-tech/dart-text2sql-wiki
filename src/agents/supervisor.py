@@ -288,6 +288,14 @@ def _domain_has_data(result: dict) -> bool:
     # kr: financial/price 중 하나라도 있으면 데이터 있음.
     if result.get("financial") or result.get("price"):
         return True
+    # kr 다중종목(named multi-entity, domain_kr._answer_kr_multi_entity_question): 최상위
+    # financial/price는 항상 None이고 실제 데이터는 entities 리스트 안에 종목별로 담긴다.
+    # entities 중 하나라도 financial/price가 있으면 데이터 있음으로 본다.
+    entities = result.get("entities")
+    if isinstance(entities, list) and any(
+        isinstance(e, dict) and (e.get("financial") or e.get("price")) for e in entities
+    ):
+        return True
     # macro: available=True.
     if result.get("available"):
         return True
@@ -521,6 +529,14 @@ def _summarize_one(domain: str, result: dict) -> str:
             bits.append(f"재무={fin.get('value') if isinstance(fin, dict) else fin}")
         if price:
             bits.append("주가 데이터 포함")
+        entities = result.get("entities")
+        if isinstance(entities, list) and entities:
+            codes = [
+                e.get("stock_code") for e in entities
+                if isinstance(e, dict) and (e.get("financial") or e.get("price"))
+            ]
+            if codes:
+                bits.append(f"다중종목 데이터 포함({', '.join(codes)})")
         return ", ".join(bits) or "데이터 없음"
     if domain == "backtest":
         if result.get("blocked"):

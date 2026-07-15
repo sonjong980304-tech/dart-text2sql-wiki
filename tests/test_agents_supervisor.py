@@ -16,6 +16,7 @@ StateGraph 배선은 다음 스토리(HA-11)의 몫이므로 여기서는 배선
 """
 from __future__ import annotations
 
+import src.agents.supervisor as supervisor_mod
 from src.agents.supervisor import (
     answer_with_verification,
     dispatch_domains,
@@ -814,3 +815,69 @@ def test_answer_with_verification_without_on_progress_is_unaffected():
         route_fn=stub_route, dispatch_fn=stub_dispatch, verify_fn=valid_verify,
     )
     assert res["uncertain"] is False
+
+
+# ── kr 다중종목(named multi-entity) 결과의 데이터 존재 판정 ────────────────────
+# 실서버 재현 버그: domain_kr.answer_kr_question이 "entities" 리스트로 다중종목 결과를
+# 반환하는데(예: "삼성전자와 SK하이닉스 종가"), _domain_has_data는 최상위 financial/price
+# 키만 보고 entities 안의 실제 데이터를 못 봐서 "데이터 없음"으로 오판 → verify_answer가
+# LLM 판정까지 가지도 못하고 매 시도 즉시 실패(재시도해도 절대 안 고쳐짐, 원래 버그와
+# 동일한 실패 패턴).
+
+def test_domain_has_data_recognizes_multi_entity_kr_result_with_price():
+    kr_result = {
+        "stock_code": None, "stock_codes": ["005930", "000660"],
+        "financial": None, "price": None,
+        "entities": [
+            {"stock_code": "005930", "financial": None,
+             "price": [{"close": 71000.0}], "errors": []},
+            {"stock_code": "000660", "financial": None,
+             "price": [{"close": 210000.0}], "errors": []},
+        ],
+        "errors": [],
+    }
+    assert supervisor_mod._domain_has_data(kr_result) is True
+
+
+def test_domain_has_data_recognizes_multi_entity_kr_result_with_financial():
+    kr_result = {
+        "stock_code": None, "stock_codes": ["005930", "000660"],
+        "financial": None, "price": None,
+        "entities": [
+            {"stock_code": "005930", "financial": {"value": 12.5}, "price": None, "errors": []},
+        ],
+        "errors": [],
+    }
+    assert supervisor_mod._domain_has_data(kr_result) is True
+
+
+def test_domain_has_data_returns_false_when_all_entities_empty():
+    kr_result = {
+        "stock_code": None, "stock_codes": ["999999"],
+        "financial": None, "price": None,
+        "entities": [
+            {"stock_code": "999999", "financial": None, "price": None,
+             "errors": ["재무 지표를 인식하지 못함"]},
+        ],
+        "errors": [],
+    }
+    assert supervisor_mod._domain_has_data(kr_result) is False
+
+
+def test_verify_answer_multi_entity_kr_result_passes_deterministic_check():
+    """실제 버그 재현: entities 데이터가 있으면 llm_fn=None 결정론 경로에서 통과해야 한다."""
+    domain_results = {
+        "kr": {
+            "stock_code": None, "stock_codes": ["005930", "000660"],
+            "financial": None, "price": None,
+            "entities": [
+                {"stock_code": "005930", "financial": None,
+                 "price": [{"close": 71000.0}], "errors": []},
+                {"stock_code": "000660", "financial": None,
+                 "price": [{"close": 210000.0}], "errors": []},
+            ],
+            "errors": [],
+        }
+    }
+    verdict = verify_answer("삼성전자와 SK하이닉스 종가 알려줘", domain_results, llm_fn=None)
+    assert verdict["valid"] is True
