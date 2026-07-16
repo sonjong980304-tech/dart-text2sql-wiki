@@ -357,6 +357,8 @@ def _screening_prompt(
         f'"top_n":<정수>,"sectors":null,"{market_key}":null}}\n'
         f"사용 가능한 지표(key: 설명):\n{fields_block}\n"
         "direction: 낮을수록/저평가 우수면 low, 높을수록 우수면 high.\n"
+        "top_n: 질문에 개수가 명시돼 있으면 그 숫자를, 명시돼 있지 않으면 10을, "
+        "'전체'/'모든 종목'/'모두'처럼 개수 제한 없이 전부를 요구하면 4000을 쓰세요.\n"
         f"{scope_line}"
         f"{market_rule}"
         f"{sector_hint}\n"
@@ -429,7 +431,9 @@ def _coerce_top_n(value, default: int = 10) -> int:
         n = int(value)
     except (TypeError, ValueError):
         return default
-    return max(1, min(50, n))
+    # 하드 상한은 pipeline_exec.MAX_SIZE(전체 종목 안전 상한)와 동일하게 맞춘다 —
+    # "전체 종목" 요청이 top_n=4000까지는 잘리지 않고 그대로 통과해야 하기 때문.
+    return max(1, min(4000, n))
 
 
 def _heuristic_screening_spec(question: str, domain: str = "KR") -> dict | None:
@@ -455,7 +459,12 @@ def _heuristic_screening_spec(question: str, domain: str = "KR") -> dict | None:
     direction = "high" if any(w in q for w in high_words) else "low"
 
     count_match = re.search(r"(\d+)", q)
-    top_n = _coerce_top_n(count_match.group(1)) if count_match else 10
+    if count_match:
+        top_n = _coerce_top_n(count_match.group(1))
+    elif any(w in q for w in ("전체", "모든", "모두")):
+        top_n = _coerce_top_n(4000)  # 개수 제한 없이 전부 요구 → 상한까지 채운다
+    else:
+        top_n = 10
 
     markets = None
     exchanges = None

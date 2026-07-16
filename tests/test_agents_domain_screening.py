@@ -659,3 +659,45 @@ def test_answer_us_screening_excludes_warrant_and_adr_before_ranking():
     assert codes == ["COM1", "COM2"]
     assert "WRNT" not in codes
     assert "ADRX" not in codes
+
+
+# ── _coerce_top_n: 상한 완화(50→4000, pipeline_exec.MAX_SIZE와 동일) ─────────
+def test_coerce_top_n_allows_values_above_old_fifty_cap():
+    # 예전엔 min(50, n)이라 500이 50으로 잘렸다 — 이제는 그대로 통과해야 한다.
+    assert kr._coerce_top_n(500) == 500
+
+
+def test_coerce_top_n_still_clamps_at_new_hard_cap_of_4000():
+    assert kr._coerce_top_n(10_000) == 4000
+
+
+def test_coerce_top_n_still_clamps_lower_bound_to_one():
+    assert kr._coerce_top_n(0) == 1
+    assert kr._coerce_top_n(-5) == 1
+
+
+# ── _heuristic_screening_spec: "전체/모든/모두" 질문은 top_n을 크게(4000) ────
+def test_heuristic_screening_spec_all_stocks_phrase_sets_large_top_n():
+    spec = kr._heuristic_screening_spec("코스피 전체 종목 PBR 낮은 순으로 보여줘")
+    assert spec is not None
+    assert spec["top_n"] == 4000
+
+
+def test_heuristic_screening_spec_explicit_count_not_overridden_by_all_phrase():
+    # "전체"가 있어도 명시적 숫자가 있으면 그 숫자를 우선한다.
+    spec = kr._heuristic_screening_spec("전체 종목 중에서 PBR 낮은 10개 보여줘")
+    assert spec is not None
+    assert spec["top_n"] == 10
+
+
+def test_heuristic_screening_spec_without_count_or_all_phrase_defaults_to_ten():
+    spec = kr._heuristic_screening_spec("PBR 낮은 순으로 보여줘")
+    assert spec is not None
+    assert spec["top_n"] == 10
+
+
+# ── _screening_prompt: LLM에게 "전체" 판단 기준(4000) 지시문이 포함되는지 ────
+def test_screening_prompt_includes_all_stocks_guidance_with_new_cap():
+    prompt = kr._screening_prompt("코스피 전체 종목 PBR 낮은 순", kr._KR_SCREEN_FIELDS, (), domain="KR")
+    assert "전체" in prompt
+    assert "4000" in prompt

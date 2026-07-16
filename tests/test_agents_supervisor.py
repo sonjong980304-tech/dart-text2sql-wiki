@@ -75,6 +75,28 @@ def test_route_question_fallback_defaults_to_kr():
     assert route_question("삼성전자 PER 알려줘", None) == ["kr"]
 
 
+def test_route_question_fallback_without_llm_detects_correlation_as_backtest():
+    """실사용 회귀: "상관관계"를 물으면 '백테스트'/'전략' 단어가 전혀 없어도 backtest로
+    라우팅돼야 한다 — 팩터간 상관관계·분위수 분석은 backtest 도메인의 correlation/
+    quantile_bucket_means 프리미티브(get_cross_section 기반, top_n 상한 없음)로만 계산
+    가능한데, 예전 키워드 사전엔 '전략 백테스트' 관련 단어만 있어 kr 스크리닝으로 잘못
+    빠졌었다(실서버 curl로 확인된 버그)."""
+    routes = route_question("코스피 PBR과 GPA의 상관관계 구해줘", None)
+    assert "backtest" in routes
+
+
+def test_route_question_fallback_without_llm_detects_quantile_as_backtest():
+    routes = route_question("PBR 5분위수별 평균 GPA 보여줘", None)
+    assert "backtest" in routes
+
+
+def test_route_prompt_mentions_correlation_and_quantile_for_llm_routing():
+    """LLM 우선 라우팅 경로도 인식하도록 _route_prompt의 backtest 설명에 상관관계/분위수
+    분석이 포함돼야 한다("전략 백테스트"로만 설명되면 LLM도 이 도메인을 놓친다)."""
+    prompt = supervisor_mod._route_prompt("아무 질문")
+    assert "상관관계" in prompt or "분위수" in prompt
+
+
 def test_route_question_fallback_returns_empty_for_completely_unrelated_question():
     """휴리스틱 키워드 사전에 전혀 안 걸리는 질문(LLM도 없을 때)은 무조건 ['kr']로
     폴백하지 않고 빈 리스트(unknown)를 반환해야 한다 — 무관한 질문에 한국주식을 억지로
