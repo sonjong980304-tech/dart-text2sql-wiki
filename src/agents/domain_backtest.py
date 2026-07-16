@@ -42,15 +42,23 @@ _PIPELINE_PROMPT = """당신은 SQL로 표현 불가능한 통계/퀀트 분석 
 
 아래 질문을 프리미티브 조립 JSON 파이프라인으로 변환하세요. 파이썬 코드 금지, JSON만 출력.
 
-[사용 가능한 프리미티브 15종 — 이 외의 함수는 존재하지 않습니다]
+[사용 가능한 프리미티브 17종 — 이 외의 함수는 존재하지 않습니다]
 1. get_cross_section(asof, markets) : 특정 시점의 전종목 횡단면 지표 스냅샷(list of rows) 반환.
    각 row 필드: stock_code,name,sector,market,quarter,close,market_cap,per,pbr,psr,
    roe,roa,operating_margin,net_margin,debt_ratio,revenue_growth,op_growth,ni_growth,return_12m,
-   gross_profit,total_assets,gp_a.
+   gross_profit,total_assets,gp_a,earnings_yield,roc,roc_estimated.
    · return_12m: 직전 12개월 가격 수익률(%) = (기준시점 종가 - 12개월전 종가)/12개월전 종가.
      "최근 12개월 수익률/가격 모멘텀이 가장 좋은 종목" 류 질문은 매출성장(revenue_growth)이
      아니라 반드시 이 return_12m을 direction='high'로 써야 합니다.
    · gp_a: 매출총이익(TTM) ÷ 총자산(%) — GPA 수익성 팩터. "GPA"/"매출총이익/자산" 질문에 씁니다.
+   · earnings_yield: 이익수익률(EY, %) = 마법공식 EBIT ÷ 기업가치EV. "이익수익률"/"마법공식"
+     밸류 팩터(높을수록 저평가). roc: 투하자본수익률(ROC, %) = EBIT ÷ 투하자본IC.
+     "투하자본수익률"/"마법공식" 수익성 팩터(높을수록 우수). 마법공식 산점도는 이 둘을 씁니다.
+   · roc_estimated: bool|null. 감가상각비 데이터가 없는 종목(삼성전자 등 다수 대형주 —
+     DART 표준 API에 계정 자체가 없음)은 감가상각비를 0으로 근사해 roc를 계산하고
+     이때 true가 됩니다(실측이면 false, roc 자체가 null이면 null). "삼성전자 ROC 알려줘"
+     류 질문에 답할 때 이 값이 true면 반드시 "감가상각비 데이터가 없어 근사치"라고
+     답변에 명시하세요 — 실측치처럼 단정하면 안 됩니다.
    asof는 'YYYY-MM-DD' 구체 날짜(오늘={today}). conn은 실행기가 자동 주입하므로 쓰지 마세요.
    · markets(선택, 예: ["KOSPI"]) : 시장 필터. "코스피 전종목"/"코스닥 전종목"처럼 특정
      시장으로 한정하는 질문은 이 단계에서 markets로 걸러야 합니다. **run_backtest의 markets
@@ -162,6 +170,15 @@ _PIPELINE_PROMPT = """당신은 SQL로 표현 불가능한 통계/퀀트 분석 
     value_field(예: gp_a)의 평균을 구합니다. "PBR 분위수별 평균 GPA" 같은 팩터 분석 질문에
     씁니다. 반환은 [{{bucket, count, bucket_range:[최소,최대], mean_value}}, ...] 리스트이며
     bucket=1이 bucket_field가 가장 낮은 분위, bucket=n이 가장 높은 분위입니다.
+16. remove_outliers(rows, field, k) : field 값이 [Q1-k·IQR, Q3+k·IQR] 범위를 벗어나는 row를
+    통째로 제거해 나머지를 반환합니다(winsorize=값을 누르기와 달리, 이건 이상치 행을 실제로
+    걷어냄, k 미지정시 1.5). "산점도에서 이상치를 빼고/제거하고 그려줘" 같은 요청에서 산점도
+    데이터를 만들기 전에 씁니다. field가 None인 row는 유지하며, 원본 필드는 그대로 둡니다.
+17. scatter_data(rows, x_field, y_field) : rows에서 두 필드를 산점도용 (x, y, labels)로 뽑아
+    {{x, y, labels, x_field, y_field}} dict로 반환합니다. 두 지표의 관계를 점으로 뿌리는
+    산점도(예: "이익수익률과 투하자본수익률 산점도")의 마지막 단계로 씁니다. x·y 두 좌표가
+    모두 있는 종목만 포함됩니다(하나라도 None이면 제외). x_field/y_field는 get_cross_section
+    필드 중에서만 고릅니다.
 
 [JSON 형식]
 - {{"pipeline": [{{"op": "이름", "params": {{...}}, "out": "결과이름"}}, ...]}}
@@ -190,6 +207,13 @@ A: {{"pipeline": [
   {{"op": "get_cross_section", "params": {{"asof": "{today}"}}, "out": "xs"}},
   {{"op": "correlation", "params": {{"rows": {{"$ref": "xs"}}, "field_x": "pbr", "field_y": "gp_a"}}, "out": "corr"}},
   {{"op": "quantile_bucket_means", "params": {{"rows": {{"$ref": "xs"}}, "bucket_field": "pbr", "value_field": "gp_a", "n": 5}}, "out": "buckets"}}
+]}}
+Q: 이익수익률과 투하자본수익률 산점도 그려줘, 이상치는 빼고
+A: {{"pipeline": [
+  {{"op": "get_cross_section", "params": {{"asof": "{today}"}}, "out": "xs"}},
+  {{"op": "remove_outliers", "params": {{"rows": {{"$ref": "xs"}}, "field": "earnings_yield"}}, "out": "xs1"}},
+  {{"op": "remove_outliers", "params": {{"rows": {{"$ref": "xs1"}}, "field": "roc"}}, "out": "xs2"}},
+  {{"op": "scatter_data", "params": {{"rows": {{"$ref": "xs2"}}, "x_field": "earnings_yield", "y_field": "roc"}}, "out": "scatter"}}
 ]}}
 Q: 2024년부터 2026년까지 매 분기 리밸런싱했을 때 MDD -10% 이내이면서 샤프가 가장 높은 전략 찾아줘
 A: {{"pipeline": [

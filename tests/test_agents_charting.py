@@ -10,7 +10,7 @@ from __future__ import annotations
 import base64
 import struct
 
-from src.agents.charting import render_line_chart_base64
+from src.agents.charting import render_line_chart_base64, render_scatter_chart_base64
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -67,4 +67,30 @@ def test_render_line_chart_base64_many_points_limits_xticks():
     """포인트가 많아도(라벨 과밀 방지: 최대 12개) 예외 없이 유효 PNG."""
     dates = [f"2024-{(i % 12) + 1:02d}-01" for i in range(60)]
     b64 = render_line_chart_base64(dates, {"전략": [1.0 + i * 0.01 for i in range(60)]}, "장기 추이")
+    _assert_valid_png(b64)
+
+
+# ── 산점도(scatter) 렌더링 — 라인차트와 동일한 한글폰트/Agg/PNG 검증 수준 ────────────
+
+def test_render_scatter_chart_base64_returns_valid_png_with_korean_labels():
+    """한글 축라벨/제목/점라벨 케이스 — 라인차트와 동일 폰트 폴백을 재사용해야 한다."""
+    b64 = render_scatter_chart_base64(
+        [5.0, 8.0, 3.0], [12.0, 20.0, 9.0], ["가", "나", "다"],
+        "이익수익률(%)", "투하자본수익률(%)", "마법공식 산점도",
+    )
+    _assert_valid_png(b64)
+
+
+def test_render_scatter_chart_base64_without_labels():
+    """labels=None이어도 예외 없이 유효 PNG."""
+    b64 = render_scatter_chart_base64([1.0, 2.0], [3.0, 4.0], None, "x", "y", "제목")
+    _assert_valid_png(b64)
+
+
+def test_render_scatter_chart_base64_many_points():
+    """점이 많아도(라벨 과밀) 예외 없이 유효 PNG."""
+    x = [float(i) for i in range(200)]
+    y = [float(i * 2) for i in range(200)]
+    labels = [f"종목{i}" for i in range(200)]
+    b64 = render_scatter_chart_base64(x, y, labels, "EY", "ROC", "대량 산점도")
     _assert_valid_png(b64)

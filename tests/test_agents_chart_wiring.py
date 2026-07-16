@@ -169,6 +169,105 @@ def test_extract_chart_data_returns_none_for_empty_results():
     assert sup._extract_chart_data({}, conn=None) is None
 
 
+# ── _extract_scatter_data — 백테스트 결과가 scatter_data(dict)면 산점도로 인식 ──────────
+
+def test_extract_scatter_data_recognizes_backtest_scatter_result():
+    import src.agents.supervisor as sup
+
+    domain_results = {
+        "backtest": {
+            "blocked": False,
+            "result": {
+                "x": [5.0, 8.0, 3.0], "y": [12.0, 20.0, 9.0],
+                "labels": ["가", "나", "다"],
+                "x_field": "earnings_yield", "y_field": "roc",
+            },
+        }
+    }
+    out = sup._extract_scatter_data(domain_results)
+    assert out is not None
+    x, y, labels, x_label, y_label, title = out
+    assert x == [5.0, 8.0, 3.0]
+    assert y == [12.0, 20.0, 9.0]
+    assert labels == ["가", "나", "다"]
+    assert x_label == "earnings_yield" and y_label == "roc"
+    assert "산점도" in title and "earnings_yield" in title
+
+
+def test_extract_scatter_data_none_for_line_backtest_result():
+    """기존 시계열(dates/navs) 백테스트 결과는 산점도가 아니다 → None(라인차트 경로로 감)."""
+    import src.agents.supervisor as sup
+
+    domain_results = {"backtest": {"result": {"dates": ["a", "b"], "navs": [1.0, 1.1]}}}
+    assert sup._extract_scatter_data(domain_results) is None
+
+
+def test_extract_scatter_data_none_when_blocked():
+    import src.agents.supervisor as sup
+
+    domain_results = {"backtest": {"blocked": True, "result": {
+        "x": [1.0], "y": [2.0], "labels": ["가"], "x_field": "a", "y_field": "b"}}}
+    assert sup._extract_scatter_data(domain_results) is None
+
+
+def test_build_chart_renders_scatter_png_when_backtest_is_scatter():
+    import src.agents.supervisor as sup
+
+    domain_results = {
+        "backtest": {"result": {
+            "x": [5.0, 8.0, 3.0], "y": [12.0, 20.0, 9.0],
+            "labels": ["가", "나", "다"],
+            "x_field": "earnings_yield", "y_field": "roc",
+        }}
+    }
+    out = sup._build_chart(domain_results, conn=None)
+    assert out is not None
+    chart_base64, title = out
+    assert base64.b64decode(chart_base64)[:8] == _PNG_MAGIC
+    assert "산점도" in title
+
+
+def test_build_chart_scatter_takes_priority_over_line(monkeypatch):
+    """산점도 데이터가 있으면 라인차트보다 우선(질문당 차트 1개)."""
+    import src.agents.supervisor as sup
+
+    # 라인 경로가 호출되면 실패 표시 — 산점도 우선이면 호출되면 안 된다.
+    monkeypatch.setattr(
+        sup, "_extract_chart_data",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("산점도 우선순위 위반")),
+    )
+    domain_results = {"backtest": {"result": {
+        "x": [1.0, 2.0], "y": [3.0, 4.0], "labels": ["가", "나"],
+        "x_field": "earnings_yield", "y_field": "roc"}}}
+    out = sup._build_chart(domain_results, conn=None)
+    assert out is not None
+    assert "산점도" in out[1]
+
+
+def test_answer_with_verification_adds_scatter_chart_when_requested():
+    """'산점도 그려줘' + 백테스트 scatter 결과 → 성공 응답에 chart_base64(PNG) 배선."""
+    from src.agents.supervisor import answer_with_verification
+
+    bt = {"result": {
+        "x": [5.0, 8.0, 3.0], "y": [12.0, 20.0, 9.0], "labels": ["가", "나", "다"],
+        "x_field": "earnings_yield", "y_field": "roc"}}
+
+    def stub_route(question, llm_fn):
+        return ["backtest"]
+
+    def stub_dispatch(routes, question, conn, llm_fn, steps=None):
+        return {"backtest": bt}
+
+    res = answer_with_verification(
+        "이익수익률과 투하자본수익률 산점도 그려줘", conn=None, llm_fn=None,
+        route_fn=stub_route, dispatch_fn=stub_dispatch, verify_fn=_valid_verify,
+    )
+    assert res["uncertain"] is False
+    assert res.get("chart_base64")
+    assert base64.b64decode(res["chart_base64"])[:8] == _PNG_MAGIC
+    assert "산점도" in res["chart_title"]
+
+
 # ── answer_with_verification — 성공 경로에 chart_base64/chart_title 배선 ──────
 
 def _valid_verify(question, domain_results, llm_fn):

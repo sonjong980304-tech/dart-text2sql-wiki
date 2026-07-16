@@ -147,6 +147,64 @@ def winsorize(rows: list[dict], field: str, k: float = 1.5) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
+# 3c. remove_outliers — IQR 기반 이상치 "행 제거"(winsorize=값 누르기와 목적이 다름)
+# --------------------------------------------------------------------------
+def remove_outliers(rows: list[dict], field: str, method: str = "iqr", k: float = 1.5) -> list[dict]:
+    """field 값이 [Q1-k·IQR, Q3+k·IQR] 범위를 벗어나는 row를 통째로 제거해 나머지를 반환한다.
+
+    winsorize(극단치를 경계로 눌러 값 자체를 바꿈, 행 보존)와 목적이 다르다 — 이건 산점도에서
+    "이상치를 빼고 그려줘" 같은 요청처럼 이상치 행을 실제로 걷어낼 때 쓴다. field 값이 None인
+    row는 이 필드로 이상치 판단이 불가하므로 조용히 유지한다(데이터 자체를 지우는 게 아니라 이
+    필드 기준으로 튄 행만 제거하는 것). 유효 표본이 4개 미만이면 사분위 경계를 안정적으로 낼 수
+    없어 원본을 그대로 통과시킨다(winsorize와 동일한 표본부족 관례). 원본 rows는 변경하지 않고
+    새 리스트를 반환한다. k=1.5는 박스플롯 whisker 기준의 흔한 이상치 경계 배수.
+    """
+    if method != "iqr":
+        raise ValueError(f"지원하지 않는 method: {method} (iqr만 가능)")
+    import numpy as np
+
+    vals = [r[field] for r in rows if r.get(field) is not None]
+    if len(vals) < 4:
+        return list(rows)
+
+    q1, q3 = np.percentile(vals, [25, 75])
+    iqr = q3 - q1
+    lower, upper = q1 - k * iqr, q3 + k * iqr
+
+    out = []
+    for r in rows:
+        v = r.get(field)
+        if v is None or lower <= v <= upper:
+            out.append(r)
+    return out
+
+
+# --------------------------------------------------------------------------
+# 3d. scatter_data — rows에서 두 필드를 산점도용 (x, y, labels) dict로 변환
+# --------------------------------------------------------------------------
+def scatter_data(rows: list[dict], x_field: str, y_field: str, label_field: str = "name") -> dict:
+    """rows(예: get_cross_section→remove_outliers 결과)에서 두 필드를 뽑아 산점도용 dict로 만든다.
+
+    반환 {"x":[...], "y":[...], "labels":[...], "x_field":.., "y_field":..} — 총괄
+    에이전트(_extract_scatter_data)가 이 형태를 인식해 산점도를 렌더링한다. 산점도의 한 점은
+    x·y 두 좌표가 모두 있어야 찍히므로, 둘 중 하나라도 None인 row는 제외한다(라벨은 label_field,
+    없으면 stock_code로 폴백). "이익수익률과 투하자본수익률 산점도" 같은 파이프라인의 마지막
+    단계로 쓴다.
+    """
+    xs: list = []
+    ys: list = []
+    labels: list = []
+    for r in rows:
+        x, y = r.get(x_field), r.get(y_field)
+        if x is None or y is None:
+            continue
+        xs.append(x)
+        ys.append(y)
+        labels.append(r.get(label_field) or r.get("stock_code"))
+    return {"x": xs, "y": ys, "labels": labels, "x_field": x_field, "y_field": y_field}
+
+
+# --------------------------------------------------------------------------
 # 4. combine — select_stocks(멀티팩터 가중조합) 래핑
 # --------------------------------------------------------------------------
 def combine(

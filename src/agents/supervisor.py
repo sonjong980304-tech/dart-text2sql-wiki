@@ -37,7 +37,7 @@ import re
 from datetime import date
 from typing import Callable
 
-from src.agents.charting import render_line_chart_base64
+from src.agents.charting import render_line_chart_base64, render_scatter_chart_base64
 from src.agents.data_price_kr import get_price_history_kr
 from src.agents.data_price_us import get_price_history_us
 from src.agents.domain_backtest import answer_backtest_question
@@ -219,13 +219,48 @@ def _extract_chart_data(domain_results: dict, conn) -> tuple[list, dict, str] | 
     return None
 
 
+def _extract_scatter_data(domain_results: dict) -> tuple[list, list, list | None, str, str, str] | None:
+    """domain_results에서 산점도로 그릴 데이터를 고른다(백테스트 scatter_data 프리미티브 결과).
+
+    반환: (x, y, labels, x_label, y_label, title). 백테스트 파이프라인이 scatter_data
+    프리미티브로 끝나면 result가 {"x":[...],"y":[...],"labels":[...],"x_field":..,"y_field":..}
+    형태이며, 이를 인식해 산점도 스펙으로 변환한다. 산점도 데이터가 없으면(기존 시계열 백테스트
+    등) None을 반환해 _build_chart가 기존 라인차트 경로로 폴백한다(기존 3케이스 동작 불변).
+    """
+    bt = domain_results.get("backtest")
+    if not isinstance(bt, dict) or bt.get("blocked"):
+        return None
+    res = bt.get("result")
+    if (
+        isinstance(res, dict)
+        and res.get("x") and res.get("y")
+        and "x_field" in res and "y_field" in res
+    ):
+        x_field, y_field = res["x_field"], res["y_field"]
+        labels = list(res["labels"]) if res.get("labels") else None
+        title = f"{x_field} vs {y_field} 산점도"
+        return list(res["x"]), list(res["y"]), labels, x_field, y_field, title
+    return None
+
+
 def _build_chart(domain_results: dict, conn) -> tuple[str, str] | None:
-    """_extract_chart_data로 데이터를 고르고 render_line_chart_base64로 PNG(base64)를 만든다.
+    """차트 데이터를 고르고 base64 PNG를 만든다. 산점도(2팩터 관계)를 시계열 라인차트보다
+    우선 확인하고, 산점도 데이터가 있으면 render_scatter_chart_base64로, 없으면 기존
+    _extract_chart_data(시계열 3케이스)를 render_line_chart_base64로 그린다.
 
     반환: (chart_base64, chart_title) 또는 None(그릴 데이터가 없거나 렌더링 실패 시). 차트는
     부가 기능이므로, 렌더링이 어떤 이유로든 실패해도 예외를 전파하지 않고 None으로 흡수해
     본문 텍스트 응답이 깨지지 않게 한다.
     """
+    scatter = _extract_scatter_data(domain_results)
+    if scatter is not None:
+        x, y, labels, x_label, y_label, title = scatter
+        try:
+            chart_base64 = render_scatter_chart_base64(x, y, labels, x_label, y_label, title)
+        except Exception:  # noqa: BLE001 — 차트 실패가 본문 응답을 무너뜨리지 않게 한다
+            return None
+        return chart_base64, title
+
     data = _extract_chart_data(domain_results, conn)
     if data is None:
         return None

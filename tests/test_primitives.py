@@ -18,7 +18,9 @@ from src.backtest.primitives import (
     neutralize,
     optimize_weights,
     regress,
+    remove_outliers,
     run_backtest_primitive,
+    scatter_data,
     winsorize,
     zscore,
 )
@@ -202,6 +204,99 @@ def test_winsorize_passes_through_when_too_few_samples_for_quartiles():
 # --------------------------------------------------------------------------
 # combine — select_stocks(멀티팩터 가중조합) 래핑
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# remove_outliers — IQR 기반 이상치 "행 제거"(winsorize=값 누르기와 다름, 산점도 이상치 제거용)
+# --------------------------------------------------------------------------
+def _rows_field(values, field="v"):
+    return [{"stock_code": f"{i:06d}", field: v} for i, v in enumerate(values)]
+
+
+def test_remove_outliers_removes_extreme_high_outlier():
+    """정규 군집 + 극단치 1개 → 극단치 행이 제거되고 군집은 전부 남는다."""
+    rows = _rows_field([100, 101, 102, 103, 104, 105, 106, 107, 10000])
+    out = remove_outliers(rows, "v")
+    kept = [r["v"] for r in out]
+    assert 10000 not in kept
+    assert len(out) == 8
+    assert set(kept) == {100, 101, 102, 103, 104, 105, 106, 107}
+
+
+def test_remove_outliers_k_controls_removal_range():
+    """k가 크면 경계가 넓어져 덜 제거된다(같은 데이터, 다른 k → 다른 결과)."""
+    values = [10, 10, 10, 10, 10, 20, 20, 20, 20, 20, 32, 200]
+    tight = remove_outliers(_rows_field(values), "v", k=1.0)   # 경계 [0,30] → 32,200 제거
+    wide = remove_outliers(_rows_field(values), "v", k=1.5)    # 경계 [-5,35] → 200만 제거
+    assert len(tight) == 10
+    assert len(wide) == 11
+    assert len(wide) > len(tight)
+
+
+def test_remove_outliers_keeps_rows_with_none_field():
+    """field가 None인 행은 이상치 판단 불가 → 조용히 유지(데이터 자체를 지우지 않음)."""
+    rows = _rows_field([100, 101, 102, 103, 104, 105, 106, 107, 10000])
+    rows.append({"stock_code": "none1", "v": None})
+    out = remove_outliers(rows, "v")
+    assert any(r.get("v") is None for r in out)          # None 행 유지
+    assert all(r.get("v") != 10000 for r in out)          # 극단치 제거
+    assert len(out) == 9                                   # 군집 8 + None 1
+
+
+def test_remove_outliers_passes_through_when_too_few_samples():
+    """유효 표본이 4개 미만이면 사분위 경계를 안정적으로 낼 수 없어 그대로 통과(제거 안 함)."""
+    rows = _rows_field([1, 2, 1000])
+    out = remove_outliers(rows, "v")
+    assert len(out) == 3
+    assert any(r["v"] == 1000 for r in out)
+
+
+def test_remove_outliers_does_not_mutate_input():
+    rows = _rows_field([100, 101, 102, 103, 104, 105, 106, 107, 10000])
+    remove_outliers(rows, "v")
+    assert len(rows) == 9  # 원본 리스트는 그대로
+
+
+def test_remove_outliers_rejects_unknown_method():
+    rows = _rows_field([1, 2, 3, 4, 5])
+    with pytest.raises(ValueError):
+        remove_outliers(rows, "v", method="zscore")
+
+
+# --------------------------------------------------------------------------
+# scatter_data — rows에서 두 필드를 (x, y, labels)로 뽑아 산점도용 dict 변환
+# --------------------------------------------------------------------------
+def test_scatter_data_extracts_x_y_and_labels():
+    rows = [
+        {"stock_code": "000001", "name": "가", "earnings_yield": 5.0, "roc": 12.0},
+        {"stock_code": "000002", "name": "나", "earnings_yield": 8.0, "roc": 20.0},
+    ]
+    out = scatter_data(rows, "earnings_yield", "roc")
+    assert out["x"] == [5.0, 8.0]
+    assert out["y"] == [12.0, 20.0]
+    assert out["labels"] == ["가", "나"]
+    assert out["x_field"] == "earnings_yield"
+    assert out["y_field"] == "roc"
+
+
+def test_scatter_data_excludes_rows_missing_either_coordinate():
+    """산점도 점은 x·y 두 좌표가 모두 있어야 찍을 수 있으므로, 하나라도 None이면 제외한다."""
+    rows = [
+        {"stock_code": "000001", "name": "가", "earnings_yield": 5.0, "roc": 12.0},
+        {"stock_code": "000002", "name": "나", "earnings_yield": None, "roc": 20.0},
+        {"stock_code": "000003", "name": "다", "earnings_yield": 8.0, "roc": None},
+        {"stock_code": "000004", "name": "라", "earnings_yield": 3.0, "roc": 9.0},
+    ]
+    out = scatter_data(rows, "earnings_yield", "roc")
+    assert out["x"] == [5.0, 3.0]
+    assert out["y"] == [12.0, 9.0]
+    assert out["labels"] == ["가", "라"]
+
+
+def test_scatter_data_label_falls_back_to_stock_code():
+    rows = [{"stock_code": "005930", "earnings_yield": 5.0, "roc": 12.0}]  # name 없음
+    out = scatter_data(rows, "earnings_yield", "roc")
+    assert out["labels"] == ["005930"]
+
+
 def test_combine_wraps_select_stocks_multifactor():
     criteria = [{"key": "per", "direction": "low", "weight": 0.5},
                 {"key": "roe", "direction": "high", "weight": 0.5}]

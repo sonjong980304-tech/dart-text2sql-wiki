@@ -849,14 +849,18 @@ def resolve_computed_metric(
     인프라)으로 최신 거래일(prices 테이블) 기준 전종목 스냅샷을 계산한 뒤 해당 종목 행
     하나만 골라낸다 — 새 SQL/계산 로직을 추가하지 않고 기존 인프라를 그대로 재사용한다.
 
-    반환 형식은 resolve_metric()과 동일한 계약을 따른다: {"stock_code","metric","value",
-    "source","period"}. source="computed"는 재무제표가 아니라 가격 시계열에서 즉석 계산된
-    값임을 표시하고, period는 계산 기준시점(asof, prices 테이블의 최신 거래일)이다.
+    반환 형식은 resolve_metric()과 동일한 계약에 "estimated"를 더한다: {"stock_code",
+    "metric","value","source","period","estimated"}. source="computed"는 재무제표가 아니라
+    가격 시계열에서 즉석 계산된 값임을 표시하고, period는 계산 기준시점(asof, prices 테이블의
+    최신 거래일)이다. estimated는 행에 '{metric}_estimated' 컴패니언 필드(예: roc_estimated —
+    감가상각비 데이터가 없어 0으로 근사했는지)가 있으면 그 값을, 없으면 None을 담는다 —
+    metrics_at()이 계산한 근사 여부가 단일종목 조회에서도 조용히 사라지지 않게 한다.
     """
     execute_sql_fn = execute_sql_fn or execute_sql
     cross_section_fn = cross_section_fn or (lambda c, a: get_cross_section(c, a))
     asof = _default_screening_asof(conn, "prices", execute_sql_fn)
     value = None
+    estimated = None
     if asof:
         row = next(
             (r for r in cross_section_fn(conn, asof) if r.get("stock_code") == stock_code),
@@ -864,9 +868,10 @@ def resolve_computed_metric(
         )
         if row is not None:
             value = row.get(metric)
+            estimated = row.get(f"{metric}_estimated")
     return {
         "stock_code": stock_code, "metric": metric,
-        "value": value, "source": "computed", "period": asof,
+        "value": value, "source": "computed", "period": asof, "estimated": estimated,
     }
 
 

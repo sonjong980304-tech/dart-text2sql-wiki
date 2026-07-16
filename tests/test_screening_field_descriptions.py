@@ -25,7 +25,13 @@ from src.backtest.data_access import METRIC_FIELD_DESCRIPTIONS, metrics_at
 from src.backtest.data_access_us import METRIC_FIELD_DESCRIPTIONS_US
 from src.db import init_db
 
-_META_FIELDS = {"stock_code", "name", "sector", "market", "quarter", "close", "market_cap"}
+_META_FIELDS = {
+    "stock_code", "name", "sector", "market", "quarter", "close", "market_cap",
+    # roc_estimated는 랭킹/필터 대상 "지표"가 아니라 roc의 근사 여부를 알리는 메타 플래그
+    # (감가상각비 데이터가 없어 0으로 근사했는지) — METRIC_FIELD_DESCRIPTIONS(스크리닝
+    # criteria.key 후보 목록)에는 포함시키지 않는다.
+    "roc_estimated",
+}
 
 
 def _seed_kr_one_stock(tmp_path) -> sqlite3.Connection:

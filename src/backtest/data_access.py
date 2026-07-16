@@ -128,6 +128,8 @@ METRIC_FIELD_DESCRIPTIONS: dict[str, str] = {
     "gross_profit": "매출총이익(원화 절대값, TTM 합산)",
     "total_assets": "총자산(원화 절대값, 해당분기 잔액)",
     "gp_a": "매출총이익/총자산(GPA, %, TTM 매출총이익 ÷ 해당분기 총자산). 수익성 팩터(높을수록 우수)",
+    "earnings_yield": "이익수익률(EY, %, 마법공식 EBIT ÷ 기업가치EV). 밸류 팩터(높을수록 저평가·우수)",
+    "roc": "투하자본수익률(ROC, %, 마법공식 EBIT ÷ 투하자본IC). 수익성 팩터(높을수록 우수)",
 }
 
 
@@ -174,6 +176,15 @@ def metrics_at(conn, asof: str) -> list[dict]:
         rev_q = _fin(conn, code, q, "revenue")
         ni_q = _fin(conn, code, q, "net_income")
 
+        # 마법공식(EY/ROC) 입력 — 손익계산서 항목은 TTM(4분기 합), 재무상태표 항목은 시점 스냅샷.
+        tax_ttm = _sum_ttm(conn, code, q, "tax_expense")          # 법인세비용(TTM)
+        int_ttm = _sum_ttm(conn, code, q, "interest_expense")     # 이자비용(TTM)
+        cur_assets = _fin(conn, code, q, "current_assets")        # 유동자산(스냅샷)
+        cur_liab = _fin(conn, code, q, "current_liabilities")     # 유동부채(스냅샷)
+        noncur_assets = _fin(conn, code, q, "non_current_assets") # 비유동자산(스냅샷)
+        cash = _fin(conn, code, q, "cash")                        # 현금및현금성자산(스냅샷)
+        dep = _fin(conn, code, q, "depreciation")                 # 감가상각비(스냅샷)
+
         # 순이익 데이터 오류(자기자본 대비 비현실적 거대 = Q4 차분 폭발/원본 오류) 방어.
         # 순이익 기반 지표(PER·ROE·ROA)를 무효화해 다원넥스뷰 5.7경 같은 종목을 배제.
         if ni_ttm is not None and equity and equity > 0 and abs(ni_ttm) > equity * NI_TO_EQUITY_MAX_RATIO:
@@ -203,6 +214,37 @@ def metrics_at(conn, asof: str) -> list[dict]:
         prev_close, _ = _price_at(conn, code, _one_year_before(asof))
         return_12m = _div(close - prev_close, prev_close, pct=True) if (prev_close and prev_close > 0) else None
 
+        # ── 마법공식 이익수익률(EY)/투하자본수익률(ROC) — GPA와 동일하게 크로스섹션 노출 ──
+        # EBIT = 당기순이익(TTM)+법인세비용(TTM)+이자비용(TTM). 손익계산서 항목만 TTM.
+        # 셋 중 하나라도 없으면 EBIT None(추정 안 함). ni_ttm은 위 이상치 가드로 None일 수
+        # 있고, 그 경우 EBIT도 자연히 None → EY/ROC None(가드가 그대로 반영된다).
+        ebit = (ni_ttm + tax_ttm + int_ttm) if (
+            ni_ttm is not None and tax_ttm is not None and int_ttm is not None
+        ) else None
+        # 여유자금(excess cash): 운전자본 소요분 max(0, 유동부채-유동자산+현금)을 현금에서
+        # 뺀 그린블라트 표준 방식. 현금/유동자산/유동부채가 하나라도 없으면 계산 불가(None).
+        if cash is not None and cur_assets is not None and cur_liab is not None:
+            excess_cash = cash - max(0.0, cur_liab - cur_assets + cash)
+        else:
+            excess_cash = None
+        # 기업가치 EV = 시총 + 총부채 - 여유자금. EV<=0이면 EY 무의미 → None(0/음수 나누기 방지).
+        ev = (cap + liab - excess_cash) if (
+            cap is not None and liab is not None and excess_cash is not None
+        ) else None
+        earnings_yield = _div(ebit, ev, pct=True) if (ebit is not None and ev is not None and ev > 0) else None
+        # 투하자본 IC = (유동자산-유동부채)+(비유동자산-감가상각비). IC<=0이면 ROC 무의미 → None.
+        # 감가상각비는 DART 표준 API에 계정 자체가 없는 종목이 많다(삼성전자 등 대형주 다수 —
+        # 사업보고서 주석에서만 확인 가능하나 이 프로젝트가 수집하는 API 범위 밖). 감가상각비가
+        # 없다고 ROC를 통째로 포기하는 대신 0으로 근사한다(비유동자산을 깎지 않으므로 IC가
+        # 실제보다 커져 ROC는 실제보다 낮게=보수적으로 나오는 안전한 방향의 근사). roc_estimated로
+        # 이 근사가 적용됐는지 항상 표시한다.
+        dep_for_ic = dep if dep is not None else 0.0
+        ic = ((cur_assets - cur_liab) + (noncur_assets - dep_for_ic)) if (
+            cur_assets is not None and cur_liab is not None and noncur_assets is not None
+        ) else None
+        roc = _div(ebit, ic, pct=True) if (ebit is not None and ic is not None and ic > 0) else None
+        roc_estimated = (dep is None) if roc is not None else None
+
         out.append({
             "stock_code": code, "name": c["name"], "sector": c["sector"], "market": c["market"],
             "quarter": q, "close": close, "market_cap": cap,
@@ -222,6 +264,9 @@ def metrics_at(conn, asof: str) -> list[dict]:
             "gross_profit": gp_ttm,
             "total_assets": assets,
             "gp_a": _div(gp_ttm, assets, pct=True) if (gp_ttm is not None and assets and assets > 0) else None,
+            "earnings_yield": earnings_yield,
+            "roc": roc,
+            "roc_estimated": roc_estimated,
             "debt_ratio": _div(liab, equity, pct=True) if (equity and equity > 0) else None,
             "revenue_growth": _yoy(conn, code, q, "revenue"),
             "op_growth": _yoy(conn, code, q, "operating_profit"),

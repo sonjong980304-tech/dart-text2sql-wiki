@@ -247,6 +247,23 @@ def test_generate_backtest_steps_prompt_includes_question_and_primitives():
     assert "gp_a" in captured["prompt"]  # GPA 필드도 get_cross_section 필드 목록에 노출돼야 함
 
 
+def test_pipeline_prompt_documents_scatter_and_outlier_primitives():
+    """산점도/이상치제거 프리미티브와 마법공식 필드가 프롬프트에 노출돼야 LLM이 '이익수익률과
+    투하자본수익률 산점도, 이상치 제거' 파이프라인을 스스로 조립할 수 있다."""
+    captured: dict = {}
+
+    def fake_llm(prompt):
+        captured["prompt"] = prompt
+        return json.dumps({"pipeline": []})
+
+    generate_backtest_steps("이익수익률과 투하자본수익률 산점도 그려줘 이상치는 빼고", fake_llm)
+    p = captured["prompt"]
+    assert "remove_outliers" in p        # 이상치 행 제거 프리미티브
+    assert "scatter_data" in p           # 산점도용 데이터 정리 프리미티브
+    assert "earnings_yield" in p         # 마법공식 이익수익률 필드
+    assert "roc" in p                    # 마법공식 투하자본수익률 필드
+
+
 def test_pipeline_prompt_documents_get_cross_section_markets_filter():
     """get_cross_section에 markets 필터가 있다는 걸 프롬프트가 알려줘야, LLM이 '코스피
     전종목' 류 질문에서 존재하지 않는 파라미터(예: run_backtest의 markets를 잘못 전용)를

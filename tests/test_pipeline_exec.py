@@ -24,9 +24,10 @@ from src.backtest.pipeline_exec import (
 # --------------------------------------------------------------------------
 # 고정 dict 디스패치 (getattr 부재)
 # --------------------------------------------------------------------------
-def test_dispatch_table_is_fixed_dict_with_thirteen_primitives():
+def test_dispatch_table_is_fixed_dict_with_all_primitives():
     assert set(PRIMITIVE_OPS.keys()) == {
         "get_cross_section", "zscore", "neutralize", "winsorize", "combine", "regress",
+        "correlation", "quantile_bucket_means", "remove_outliers", "scatter_data",
         "optimize_weights", "run_backtest", "run_signal_backtest", "compute_ic",
         "compute_technical_indicator", "search_strategy", "search_signal_strategy",
     }

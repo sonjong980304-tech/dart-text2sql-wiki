@@ -102,3 +102,77 @@ def test_expanded_id_map_promotes_name_only_accounts(account_id, expected):
 def test_investing_financing_cashflow_not_mapped(account_id):
     """영업활동 외 현금흐름은 operating_cashflow로 오매칭되지 않는다(None)."""
     assert normalize_account("", account_id) is None
+
+
+# ── 사이클 3: 마법공식(EY/ROC) 계산용 tax_expense / cash 정규화 규칙 추가 ──
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("법인세비용", "tax_expense"),
+        ("현금및현금성자산", "cash"),
+    ],
+)
+def test_tax_and_cash_name_matching(name, expected):
+    """이름 매칭으로 법인세비용→tax_expense, 현금및현금성자산→cash."""
+    assert normalize_account(name, None) == expected
+
+
+@pytest.mark.parametrize(
+    "account_id, expected",
+    [
+        ("ifrs-full_IncomeTaxExpenseContinuingOperations", "tax_expense"),
+        ("ifrs-full_CashAndCashEquivalents", "cash"),
+        # 접두사 변형(ifrs_)도 동일 표준키로 매핑
+        ("ifrs_IncomeTaxExpenseContinuingOperations", "tax_expense"),
+        ("ifrs_CashAndCashEquivalents", "cash"),
+    ],
+)
+def test_tax_and_cash_id_matching(account_id, expected):
+    """account_id 우선 매칭 — 계정명이 비표준이어도 표준 element ID로 안정 매핑."""
+    assert normalize_account("아무이름", account_id) == expected
+
+
+def test_income_tax_before_tax_not_mapped_to_tax_expense():
+    """'법인세비용차감전순이익'은 tax_expense가 아니다('차감전' _EXCLUDE로 차단 → None).
+
+    account_id(ifrs-full_ProfitLossBeforeTax)도 tax_expense로 매핑되지 않는다.
+    """
+    assert normalize_account("법인세비용차감전순이익", "ifrs-full_ProfitLossBeforeTax") is None
+    assert normalize_account("법인세비용차감전순이익", None) is None
+
+
+@pytest.mark.parametrize(
+    "name, account_id",
+    [
+        ("기초현금및현금성자산", "dart_CashAndCashEquivalentsAtBeginningOfPeriodCf"),
+        ("기말현금및현금성자산", "dart_CashAndCashEquivalentsAtEndOfPeriodCf"),
+        ("분기말의현금및현금성자산", "dart_CashAndCashEquivalentsAtEndOfPeriodCf"),
+    ],
+)
+def test_cashflow_begin_end_cash_not_mapped_to_cash(name, account_id):
+    """현금흐름표 기초/기말 현금은 재무상태표 cash(현금및현금성자산 스냅샷)로 오매칭되지 않는다.
+
+    이름에 '현금및현금성자산'을 부분문자열로 포함하지만 '기초'/'기말'이 _EXCLUDE로 차단되고,
+    이 계정들의 account_id(dart_...Cf)는 _DART_ID_MAP에 없어 cash로 매핑되지 않는다.
+    """
+    assert normalize_account(name, account_id) is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # 실제 data/market.db raw_reports에서 확인된 현금흐름표 오염 변형들.
+        "현금및현금성자산에 대한 환율변동효과",
+        "외화표시 현금및현금성자산의 환율변동효과",
+        "현금및현금성자산의순증가(감소)",
+        "현금및현금성자산의 증감",
+        "현금및현금성자산의증가(감소)",
+        "보유현금및현금성자산환산효과",
+        "환율변동효과 반영전 현금및현금성자산의 순증가(감소)",
+    ],
+)
+def test_cashflow_change_and_fx_cash_not_mapped_to_cash(name):
+    """현금흐름표의 환율변동효과/순증가(감소)/증감/환산효과 항목은 재무상태표 cash로 오매칭되지
+    않는다 — '현금및현금성자산'을 부분문자열로 포함하지만 흐름표 수식어(환율변동/증가/감소/증감/
+    환산효과)가 _EXCLUDE로 차단된다. 재무상태표 시점 잔액 하나만 cash로 잡아야 한다."""
+    assert normalize_account(name, None) is None

@@ -19,6 +19,7 @@ from src.agents.domain_kr import (
     classify_intent,
     find_stock_code,
     find_stock_codes,
+    resolve_computed_metric,
 )
 from src.db import connect, connect_readonly, init_db
 
@@ -910,3 +911,34 @@ def test_answer_kr_question_single_entity_question_has_no_entities_key(tmp_path)
     assert "entities" not in result
     assert result["stock_code"] == "005930"
     assert result["financial"]["value"] == 12.5
+
+
+# ── resolve_computed_metric: {metric}_estimated 컴패니언 필드 병기 ──────────────
+# "삼성전자 투하자본수익률 알려줘" 류 단일종목 질문은 get_cross_section 행 전체가 아니라
+# value 하나만 골라내므로, roc_estimated(감가상각비 근사 여부)를 명시적으로 함께 넘기지
+# 않으면 근사치라는 사실이 최종 답변에서 조용히 사라진다.
+def test_resolve_computed_metric_surfaces_estimated_companion_field():
+    fake_execute_sql = lambda sql, conn: {"ok": True, "rows": [{"d": "2026-07-15"}]}
+    fake_cross_section = lambda conn, asof: [
+        {"stock_code": "005930", "roc": 13.0, "roc_estimated": True},
+    ]
+    result = resolve_computed_metric(
+        None, "005930", "roc",
+        execute_sql_fn=fake_execute_sql, cross_section_fn=fake_cross_section,
+    )
+    assert result["value"] == 13.0
+    assert result["estimated"] is True
+
+
+def test_resolve_computed_metric_estimated_is_none_without_companion_field():
+    # return_12m처럼 {metric}_estimated 컴패니언이 아예 없는 지표는 estimated=None.
+    fake_execute_sql = lambda sql, conn: {"ok": True, "rows": [{"d": "2026-07-15"}]}
+    fake_cross_section = lambda conn, asof: [
+        {"stock_code": "005930", "return_12m": 20.0},
+    ]
+    result = resolve_computed_metric(
+        None, "005930", "return_12m",
+        execute_sql_fn=fake_execute_sql, cross_section_fn=fake_cross_section,
+    )
+    assert result["value"] == 20.0
+    assert result["estimated"] is None
