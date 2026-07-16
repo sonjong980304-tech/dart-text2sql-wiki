@@ -10,7 +10,9 @@
 핵심 책임: 질문에 나온 지표명을 보고
 1) 규칙기반 매핑표(METRIC_SOURCE_MAP)로 소스를 정하고,
 2) 매핑표에 없으면 주입된 llm_fn 판단 경로로 위임하며,
-3) DART·FnGuide 둘 다에 값이 있으면 DART 값을 우선 채택하고,
+3) DART·FnGuide 둘 다에 값이 있으면 대표값(value/source/period)은 DART를 우선 채택하되,
+   두 소스 값이 다를 수 있으므로 dart_value/fnguide_value에 양쪽을 모두 담아 최종 답변에서
+   "DART는 X, FnGuide는 Y" 식으로 병기할 수 있게 하고,
 4) 반환 dict에 항상 어느 소스를 썼는지 `source`('DART'|'FnGuide')를 담는다.
 
 섹터(company.sector)의 최종 출처는 KRX로 이미 확정되어 있어(scripts/backfill_sector_krx.py)
@@ -211,9 +213,13 @@ def resolve_metric(
 ) -> dict:
     """지표 하나를 소스 판단 후 DB에서 조회. 항상 'source'/'period'를 담은 dict 반환.
 
-    반환: {"stock_code", "metric", "value", "source", "period"}.
-    - DART·FnGuide 둘 다 값이 있으면 DART 값을 우선 채택한다(rule #3).
-    - 한쪽에만 값이 있으면 그 소스를 쓴다.
+    반환: {"stock_code", "metric", "value", "source", "period",
+           "dart_value", "dart_period", "fnguide_value", "fnguide_period"}.
+    - DART·FnGuide 둘 다 값이 있으면 대표값(value/source/period)은 DART를 우선 채택한다
+      (rule #3, 회귀 없음). 단 이 경우 두 소스 값이 다를 수 있으므로(예: 같은 '매출액'이라도
+      집계 기준이 달라 DART/FnGuide 수치가 어긋남) dart_value/fnguide_value에 양쪽을 모두
+      담아 최종 답변에서 "DART는 X, FnGuide는 Y" 식으로 병기할 수 있게 한다.
+    - 한쪽에만 값이 있으면 그 소스를 대표값으로 쓰고, 값이 없는 쪽의 *_value/*_period는 None.
     - 양쪽 다 값이 없으면 value=period=None, source엔 라우팅 판단 소스를 담는다.
     - period 인자(총괄→도메인 에이전트가 질문에서 파싱)로 DART 조회 기간을 고른다:
       None이면 기존처럼 최신 분기 1건(회귀 없음), {"kind":"quarter",...}면 그 분기,
@@ -226,13 +232,17 @@ def resolve_metric(
     fnguide_result = _fetch_fnguide(conn, stock_code, metric)
 
     if dart_result is not None:  # DART 우선(둘 다 있어도 DART)
-        value, period, source = dart_result[0], dart_result[1], DART
+        value, resolved_period, source = dart_result[0], dart_result[1], DART
     elif fnguide_result is not None:
-        value, period, source = fnguide_result[0], fnguide_result[1], FNGUIDE
+        value, resolved_period, source = fnguide_result[0], fnguide_result[1], FNGUIDE
     else:
-        value, period, source = None, None, chosen
+        value, resolved_period, source = None, None, chosen
 
     return {
         "stock_code": stock_code, "metric": metric,
-        "value": value, "source": source, "period": period,
+        "value": value, "source": source, "period": resolved_period,
+        "dart_value": dart_result[0] if dart_result else None,
+        "dart_period": dart_result[1] if dart_result else None,
+        "fnguide_value": fnguide_result[0] if fnguide_result else None,
+        "fnguide_period": fnguide_result[1] if fnguide_result else None,
     }

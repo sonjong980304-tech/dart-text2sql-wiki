@@ -128,6 +128,43 @@ def test_resolve_metric_prefers_dart_when_both_sources_have_value(tmp_path):
     assert res["source"] == "DART"
 
 
+def test_resolve_metric_exposes_both_sources_when_both_have_value(tmp_path):
+    # 둘 다 있을 때 DART를 대표값(value/source)으로 쓰되, FnGuide 값도 dart_value/
+    # fnguide_value로 함께 노출해야 한다("DART는 얼마, FnGuide는 얼마" 병기).
+    db = str(tmp_path / "both2.db")
+    init_db(db)
+    _seed_two_sources(db)
+
+    conn = connect(db)
+    try:
+        res = resolve_metric(conn, "005930", "revenue")
+    finally:
+        conn.close()
+
+    assert res["dart_value"] == 1000.0
+    assert res["dart_period"] == "2025Q1"
+    assert res["fnguide_value"] == 2000.0
+    assert res["fnguide_period"] == "2025-03-31"
+
+
+def test_resolve_metric_other_source_is_none_when_only_one_has_value(tmp_path):
+    # FnGuide 전용 지표(target_price)는 DART 쪽 값이 없으니 dart_value는 None이어야 한다.
+    db = str(tmp_path / "onlyone.db")
+    init_db(db)
+    _seed_two_sources(db)
+
+    conn = connect(db)
+    try:
+        res = resolve_metric(conn, "005930", "target_price")
+    finally:
+        conn.close()
+
+    assert res["dart_value"] is None
+    assert res["dart_period"] is None
+    assert res["fnguide_value"] == 75000.0
+    assert res["fnguide_period"] == "2025-07-11"
+
+
 def test_resolve_metric_returns_fnguide_only_metric(tmp_path):
     db = str(tmp_path / "fg.db")
     init_db(db)
