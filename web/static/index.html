@@ -126,7 +126,7 @@
   <!-- ===== 프롬프트 입력창 (질의 · 백테스트 · 팩터질문 통합 진입점) ===== -->
   <div class="card">
     <div class="row" style="align-items:flex-start">
-      <textarea id="q" rows="4" placeholder="질문을 입력하세요 (Enter 실행 · Shift+Enter 줄바꿈). 예: 삼성전자 최근 1년 주가 그래프 그려줘"
+      <textarea id="q" rows="4" placeholder="질문을 입력하세요 (Enter 실행 · Shift+Enter 줄바꿈)"
         onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();runQuery();}"></textarea>
       <!-- 실행 시 실시간 트리(SSE)가 항상 자동으로 함께 돈다(별도 토글 버튼 없음). -->
       <button id="runBtn" onclick="runQuery()">실행</button>
@@ -307,7 +307,9 @@ let _lastQueryResult=null;                                   // 재실행 결과
 function codeBlockHtml(detail,question){
   const id=_codeBlockSeq++;
   const kind=detail.kind;                                    // 'screening_spec' | 'backtest_pipeline'
-  const payload=kind==='backtest_pipeline'?detail.steps:detail.spec;
+  // screening_spec은 asof(실제 기준일)를 spec에 병합해 보여준다 — "2024년 수익률" 같은
+  // 기간 질문이 어느 날짜로 계산됐는지 조건 JSON에서 바로 확인/수정할 수 있어야 한다.
+  const payload=kind==='backtest_pipeline'?detail.steps:{...detail.spec,asof:detail.asof??null};
   _codeBlocks[id]={kind, domain:detail.domain||null, question:question||''};
   const json=JSON.stringify(payload,null,2);
   const label=kind==='backtest_pipeline'?'백테스트 실행계획':'스크리닝 조건';
@@ -350,7 +352,12 @@ async function rerunCodeBlock(id){
   const body={kind: kind_of(info), question: info.question,
     model: document.getElementById('modelSel').value||null};
   if(info.kind==='backtest_pipeline'){ body.steps=payload; body.market='KR'; }
-  else { body.domain=info.domain; body.spec=payload; }
+  else {
+    // asof는 spec이 아니라 /api/query/rerun의 별도 필드(RerunReq.asof)로 보낸다 — 사용자가
+    // 조건 JSON에서 직접 고친 기준일을 그대로 재실행에 반영하기 위함.
+    const {asof,...spec}=payload;
+    body.domain=info.domain; body.spec=spec; body.asof=asof||null;
+  }
 
   statusEl.innerHTML='<span class="spinner"></span> 재실행 중…';
   try{
@@ -416,18 +423,54 @@ const DOMAIN_LABELS={kr:'한국주식',us:'미국주식',macro:'매크로',backt
 
 // 도메인마다 dict 구조가 조금씩 달라(과설계 방지) 하나의 범용 재귀 렌더러로
 // 원본 데이터를 가공 없이 그대로 병기한다(AC4). 원시값은 fmtCell(조/억·콤마 포맷)로 표시.
-function renderValue(v){
+let _csvSeq=0;
+const _csvRegistry={};                                       // id → rows(배열-of-dict), CSV 다운로드용
+// rows(배열-of-dict) → CSV 문자열(RFC4180 최소 이스케이프). 헤더는 전체 row의 키 합집합(첫 등장 순서 유지).
+function rowsToCsv(rows){
+  const headers=[];
+  const seen=new Set();
+  rows.forEach(row=>{
+    if(row&&typeof row==='object') Object.keys(row).forEach(k=>{ if(!seen.has(k)){ seen.add(k); headers.push(k); } });
+  });
+  const esc1=v=>{
+    if(v==null) return '';
+    if(typeof v==='object') v=JSON.stringify(v);               // 중첩 객체/배열은 평평하게 펼치지 않고 직렬화만
+    const s=String(v);
+    return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;
+  };
+  const lines=[headers.map(esc1).join(',')];
+  rows.forEach(row=>lines.push(headers.map(h=>esc1(row&&typeof row==='object'?row[h]:undefined)).join(',')));
+  return '﻿'+lines.join('\n');                            // UTF-8 BOM(엑셀 한글 깨짐 방지)
+}
+function downloadCsv(id){
+  const rows=_csvRegistry[id]; if(!rows) return;
+  const csv=rowsToCsv(rows);
+  const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download=`screening_export_${id}_${new Date().toISOString().slice(0,10)}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+function renderValue(v,key){
   if(v==null) return '<span style="color:#8b93a7">—</span>';
   if(Array.isArray(v)){
     if(!v.length) return '<span style="color:#8b93a7">[]</span>';
     if(v.every(x=>x===null||typeof x!=='object')) return v.map(x=>fmtCell(x)).join(', ');
-    return v.map(x=>`<div class="kvblock">${renderValue(x)}</div>`).join('');
+    if(key!=='criteria'&&v.every(x=>x!==null&&typeof x==='object'&&!Array.isArray(x))){
+      // 배열의 모든 원소가 dict → CSV로 내려받을 수 있게 버튼 병기(AC4: 표시 자체는 가공 없이 그대로)
+      // criteria는 실제 데이터가 아니라 스크리닝 조건 메타데이터(소량)라 CSV 대상에서 제외.
+      const csvId=_csvSeq++; _csvRegistry[csvId]=v;
+      return `<div><button type="button" class="sm ghost" onclick="downloadCsv(${csvId})">⬇ CSV 다운로드</button></div>`+
+        v.map(x=>`<div class="kvblock">${renderValue(x,key)}</div>`).join('');
+    }
+    return v.map(x=>`<div class="kvblock">${renderValue(x,key)}</div>`).join('');
   }
   if(typeof v==='object'){
     const entries=Object.entries(v);
     if(!entries.length) return '<span style="color:#8b93a7">{}</span>';
     return `<table class="kvt"><tbody>${entries.map(([k,val])=>
-      `<tr><th>${esc(k)}</th><td>${renderValue(val)}</td></tr>`).join('')}</tbody></table>`;
+      `<tr><th>${esc(k)}</th><td>${renderValue(val,k)}</td></tr>`).join('')}</tbody></table>`;
   }
   return fmtCell(v);
 }

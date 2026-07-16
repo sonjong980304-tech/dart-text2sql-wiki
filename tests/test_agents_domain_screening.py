@@ -347,6 +347,10 @@ def test_answer_kr_screening_calls_on_progress_with_spec_detail():
     assert detail["kind"] == "screening_spec"
     assert detail["domain"] == "kr"
     assert detail["spec"]["criteria"] == [{"key": "per", "direction": "low"}]
+    # 실사용 회귀: "2024년 수익률" 같은 기간 질문의 실제 기준일(asof)이 spec에만 있으면
+    # 사용자가 실시간 트리에서 확인할 방법이 없다("이게 진짜 2024년 수익률인지 알 수 없다")
+    # — detail에 함께 실어 조건 JSON에서 바로 검증 가능하게 한다.
+    assert detail["asof"] == "2026-07-14"
 
 
 def test_answer_us_screening_calls_on_progress_with_spec_detail():

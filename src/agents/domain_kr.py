@@ -664,7 +664,10 @@ def _run_screening(
     if on_progress:
         on_progress(
             "code", f"{domain} 스크리닝 조건 생성 완료",
-            detail={"kind": "screening_spec", "domain": domain.lower(), "spec": spec},
+            detail={
+                "kind": "screening_spec", "domain": domain.lower(), "spec": spec,
+                "asof": resolved_asof,  # 기간 질문("2024년 수익률" 등)의 실제 기준일을 눈으로 확인 가능하게
+            },
         )
 
     requested_sectors = spec["sectors"]
