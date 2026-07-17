@@ -82,7 +82,7 @@
 
   <!-- 성과 지표 -->
   <div class="card">
-    <b>성과 지표</b> <span class="muted" style="font-size:12.5px">· 실제 10년 walk-forward 백테스트 곡선 기준</span>
+    <b>성과 지표</b> <span class="muted" style="font-size:12.5px">· 실제 <span id="periodLabel1">–</span> walk-forward 백테스트 곡선 기준</span>
     <div class="grid" style="margin-top:12px">
       <div class="metric">
         <div class="l">CAGR (연평균 복리수익)</div>
@@ -115,7 +115,7 @@
     <b>⚠ 모니터링 화면입니다 — 자동 주문은 없습니다</b>
     <ul>
       <li>이 화면은 매달 1일 배치가 계산해 저장한 값을 <b>읽기만</b> 합니다. 접속 시 즉석 재계산하지 않습니다.</li>
-      <li>비중·지표는 실제 10년 가격으로 walk-forward 백테스트(각 시점까지 데이터만 사용, 미래참조 없음)해 산출합니다.</li>
+      <li>비중·지표는 실제 <span id="periodLabel2">–</span> 가격으로 walk-forward 백테스트(각 시점까지 데이터만 사용, 미래참조 없음)해 산출합니다. 매달 배치가 돌 때마다 이 기간은 자동으로 늘어납니다(최근 종가까지 누적).</li>
       <li>실제 매수·매도 주문 실행은 이 기능의 범위 밖입니다(별도 운용 시스템 영역).</li>
     </ul>
   </div>
@@ -171,7 +171,15 @@ async function load(){
     document.getElementById('sharpeV').textContent = (d.sharpe==null)?'–':Number(d.sharpe).toLocaleString(undefined,{maximumFractionDigits:2});
     const cumEl=document.getElementById('cumV'); cumEl.textContent=pct(d.cumulative_return,1); cumEl.className='v '+((d.cumulative_return||0)>=0?'good':'bad');
 
-    drawCurve(d.backtest_curve||[]);
+    const curve = d.backtest_curve||[];
+    if(curve.length>=2){
+      const start=curve[0].date, end=curve[curve.length-1].date;
+      const years=((new Date(end)-new Date(start))/(1000*60*60*24*365.25)).toFixed(1);
+      const label=`${esc(start)}~${esc(end)} (약 ${years}년)`;
+      document.getElementById('periodLabel1').textContent=label;
+      document.getElementById('periodLabel2').textContent=label;
+    }
+    drawCurve(curve);
   }catch(e){
     document.getElementById('heroTitle').textContent = '조회 실패';
     document.getElementById('heroSub').textContent = String(e);
