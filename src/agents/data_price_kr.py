@@ -31,6 +31,10 @@ _STOCK_CODE_RE = re.compile(r"^\d{6}$")
 _PRICE_COLUMNS = "p.stock_code, p.date, p.close, p.market_cap, p.open, p.high, p.low, p.volume"
 
 
+def _escape_sql_literal(value: str) -> str:
+    return value.replace("'", "''")
+
+
 def _normalize_codes(stock_codes: str | list[str]) -> list[str]:
     """단일 종목코드(str) 또는 종목코드 리스트를 받아 6자리 숫자 형식만 남긴다.
 
@@ -45,6 +49,7 @@ def get_latest_price_kr(
     conn,
     stock_codes: str | list[str],
     execute_sql_fn: Callable | None = None,
+    asof: str | None = None,
 ) -> list[dict]:
     """한국 종목코드(6자리, 단일 str 또는 list)를 받아 prices 테이블에서 종목별 최신
     스냅샷(종가/시가총액/시가/고가/저가/거래량)을 조회한다.
@@ -56,6 +61,13 @@ def get_latest_price_kr(
     execute_sql_fn은 테스트 주입용(기본=execute_sql, HA-1 실행기) — get_cross_section의
     metrics_fn 관례와 동일한 DI 패턴이다.
 
+    asof를 지정하면 "그 시점 이하 가장 최근 거래일" 종가를 가져온다(_price_at/
+    metrics_at과 동일한 date<=asof 원칙 — 미래참조 없음). 생략하면(기본) 기존과 동일하게
+    전체 이력 중 최신 날짜를 쓴다. asof가 있어야 "삼성전자 25년 기준 주가"처럼 과거
+    시점을 지목한 질문에서 최신값이 아니라 그 시점 값을 돌려줄 수 있다(실서버 재현: PER은
+    2025년 기준으로 정확히 계산됐는데 함께 표시되는 주가는 오늘 날짜로 나와 서로 다른
+    기준시점이 뒤섞이던 버그).
+
     반환: get_cross_section과 동일한 계약의 list[dict](stock_code 필드 포함). 데이터가
     없거나 형식이 맞지 않는 종목코드는 결과에서 빠진다(순서 보장 안 함).
     """
@@ -64,10 +76,11 @@ def get_latest_price_kr(
     if not codes:
         return []
     code_list_sql = ",".join(f"'{c}'" for c in codes)
+    asof_clause = f" AND date <= '{_escape_sql_literal(asof)}'" if asof else ""
     sql = (
         f"SELECT {_PRICE_COLUMNS} FROM prices p "
         "INNER JOIN (SELECT stock_code, MAX(date) AS max_date FROM prices "
-        f"WHERE stock_code IN ({code_list_sql}) GROUP BY stock_code) latest "
+        f"WHERE stock_code IN ({code_list_sql}){asof_clause} GROUP BY stock_code) latest "
         "ON p.stock_code = latest.stock_code AND p.date = latest.max_date"
     )
     result = execute_sql_fn(sql, conn)
@@ -136,7 +149,7 @@ def get_price_snapshot_kr(
     compute_technical_indicator를 호출하지 않고 빈 리스트를 그대로 반환한다.
     """
     indicator_fn = indicator_fn or compute_technical_indicator
-    rows = get_latest_price_kr(conn, stock_codes, execute_sql_fn=execute_sql_fn)
+    rows = get_latest_price_kr(conn, stock_codes, execute_sql_fn=execute_sql_fn, asof=asof)
     if not indicators or not rows:
         return rows
     resolved_asof = asof or max(r["date"] for r in rows if r.get("date"))

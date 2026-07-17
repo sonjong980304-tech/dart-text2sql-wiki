@@ -103,6 +103,39 @@ def test_get_latest_price_kr_returns_latest_row_for_single_code(tmp_path):
     assert rows[0]["volume"] == 1.2e7
 
 
+def test_get_latest_price_kr_asof_returns_closest_trading_day_on_or_before(tmp_path):
+    # 실서버 재현 버그: "삼성전자 25년 기준 PER"처럼 재무 쪽은 과거 시점을 정확히 계산하는데
+    # 함께 표시되는 주가는 항상 오늘 최신값이라 두 값의 기준시점이 서로 달라 검증이 실패하던
+    # 문제. asof를 주면 그 시점 '이하' 가장 가까운 거래일 종가를 골라야 한다(_price_at과
+    # 동일한 date<=asof 원칙, 미래참조 없음).
+    db = _seed_prices(tmp_path, [
+        ("005930", "2025-12-30", 60000.0, 3.5e14, 59500.0, 60200.0, 59000.0, 0.9e7),
+        ("005930", "2026-07-11", 71000.0, 4.1e14, 70000.0, 71500.0, 69800.0, 1.2e7),
+    ])
+    conn = connect_readonly(db)
+    try:
+        rows = get_latest_price_kr(conn, "005930", asof="2026-06-30")
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    assert rows[0]["date"] == "2025-12-30"  # asof 이하 가장 가까운 거래일(07-11은 미래라 제외)
+    assert rows[0]["close"] == 60000.0
+
+
+def test_get_latest_price_kr_asof_none_keeps_latest_behavior(tmp_path):
+    # asof를 생략하면(기존 호출부 하위호환) 기존과 동일하게 전체 이력 중 최신을 쓴다.
+    db = _seed_prices(tmp_path, [
+        ("005930", "2025-12-30", 60000.0, 3.5e14, 59500.0, 60200.0, 59000.0, 0.9e7),
+        ("005930", "2026-07-11", 71000.0, 4.1e14, 70000.0, 71500.0, 69800.0, 1.2e7),
+    ])
+    conn = connect_readonly(db)
+    try:
+        rows = get_latest_price_kr(conn, "005930")
+    finally:
+        conn.close()
+    assert rows[0]["date"] == "2026-07-11"
+
+
 def test_get_latest_price_kr_accepts_list_of_multiple_codes(tmp_path):
     db = _seed_prices(tmp_path, [
         ("005930", "2026-07-11", 71000.0, 4.1e14, 70000.0, 71500.0, 69800.0, 1.2e7),
@@ -248,7 +281,11 @@ def test_get_price_snapshot_kr_defaults_asof_to_latest_row_date_when_not_given(t
 
 
 def test_get_price_snapshot_kr_uses_explicit_asof_when_given(tmp_path):
+    # asof(2026-06-30) 이하 행(06-25)과 이후 행(07-11)을 함께 시딩한다 — asof 이하 조회가
+    # 여전히 살아있어야(빈 rows로 조기 리턴하지 않아야) indicator_fn 호출까지 도달해
+    # "명시적 asof가 그대로 전달되는지"를 검증할 수 있다.
     db = _seed_prices(tmp_path, [
+        ("005930", "2026-06-25", 68000.0, 4.0e14, 67500.0, 68500.0, 67000.0, 1.1e7),
         ("005930", "2026-07-11", 71000.0, 4.1e14, 70000.0, 71500.0, 69800.0, 1.2e7),
     ])
     calls: list[dict] = []

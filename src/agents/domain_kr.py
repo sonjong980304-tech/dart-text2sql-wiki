@@ -1063,6 +1063,30 @@ def _parse_period(question: str) -> dict | None:
     return {"kind": "annual", "year": year}
 
 
+_CONJUNCTION_TOKENS: tuple[str, ...] = ("그리고", "이랑", "랑", "와", "과", "및", ",", "·", "&", " ")
+
+
+def _is_gap_pure_conjunction(
+    question: str, start: int, end: int, quarter_events: list[tuple[int, int, int]],
+) -> bool:
+    """[start:end) 구간 원문이 접속사(와/과/및/그리고 등)만으로 이루어졌는지 확인한다.
+
+    구간에 포함된 분기 토큰(quarter_events, 예: "1분기")은 검사에서 제외한다 — 그건
+    이미 파싱된 분기 자체이지 "지표명 반복" 같은 실질 단어가 아니기 때문이다. 나머지
+    텍스트에서 접속사 토큰을 모두 제거했을 때 빈 문자열이면 순수 접속사로 판단한다.
+    """
+    pieces: list[str] = []
+    cursor = start
+    for qs, qe, _val in sorted(e for e in quarter_events if e[0] >= start and e[1] <= end):
+        pieces.append(question[cursor:qs])
+        cursor = qe
+    pieces.append(question[cursor:end])
+    remainder = "".join(pieces)
+    for tok in _CONJUNCTION_TOKENS:
+        remainder = remainder.replace(tok, "")
+    return remainder == ""
+
+
 def _parse_periods(question: str) -> list[dict]:
     """질문에서 여러 조회 기간을 순서대로 파싱한다(다중분기 지원). _parse_period의 리스트판.
 
@@ -1082,6 +1106,14 @@ def _parse_periods(question: str) -> list[dict]:
       "1분기"를 공유해 2025Q1이 되는 것이 한국어의 자연스러운 비교 표현이기 때문이다
       (이 경우 → 2025Q1, 2026Q1). 분기가 2개 이상 서로 다르게 명시되면 공유하지 않고 bare
       연도는 그 해 연간(사업보고서)으로 남긴다(혼재 질문의 합리적 해석).
+    - 공유는 인접한 연도 슬롯 사이의 원문이 "순수 접속사"(과/와/및/그리고/쉼표 등, 그
+      구간에 속한 분기 토큰 자체는 제외)로만 이루어졌을 때만 적용한다. "25년과 26년
+      1분기"는 두 연도 사이가 "과 "뿐이라 공유되지만, "25년 영업이익률과 26년 1분기
+      영업이익률"처럼 연도 사이에 지표명 등 실질적인 단어가 끼어 있으면(=그 해에 대해
+      이미 완결된 절이 있다는 뜻) 공유하지 않고 bare 연도는 연간으로 남는다(실서버 재현:
+      "SK하이닉스 25년 영업이익률과 26년 1분기 영업이익률"이 [2025Q1,2026Q1]으로 잘못
+      해석되던 버그). 인접 연도가 없는 고립된 bare 슬롯(orphan quarter 케이스 등)은
+      기존처럼 공유를 허용한다(회귀 방지, 흔치 않은 순서).
     - 연도가 하나도 없으면(분기 단독 포함) 빈 리스트를 반환한다 — _parse_period가 None을
       돌려 "현행 최신분기 유지"로 흐르던 것과 같은 회귀-안전 동작이다.
 
@@ -1091,53 +1123,66 @@ def _parse_periods(question: str) -> list[dict]:
 
     # 연도 토큰 수집(4자리/2자리+년). 두 정규식은 lookbehind로 서로 겹치지 않는다
     # (2자리 연도는 앞에 숫자가 붙으면 매치 안 되므로 "2025" 안의 "25"는 잡히지 않음).
-    year_events: list[tuple[int, int]] = []  # (position, year)
+    year_events: list[tuple[int, int, int]] = []  # (start, end, year)
     for m in _YEAR_FULL_RE.finditer(q):
-        year_events.append((m.start(), int(m.group(1))))
+        year_events.append((m.start(), m.end(), int(m.group(1))))
     for m in _YEAR_SHORT_RE.finditer(q):
-        year_events.append((m.start(), 2000 + int(m.group(1))))
+        year_events.append((m.start(), m.end(), 2000 + int(m.group(1))))
 
     # 분기 토큰 수집(한글 "N분기" / "qN"). 같은 위치를 두 형식이 동시에 잡는 일은 없다.
-    quarter_events: list[tuple[int, int]] = []  # (position, quarter_n)
+    quarter_events: list[tuple[int, int, int]] = []  # (start, end, quarter_n)
     for m in _QUARTER_KO_RE.finditer(q):
-        quarter_events.append((m.start(), int(m.group(1))))
+        quarter_events.append((m.start(), m.end(), int(m.group(1))))
     for m in _QUARTER_Q_RE.finditer(q):
-        quarter_events.append((m.start(), int(m.group(1))))
+        quarter_events.append((m.start(), m.end(), int(m.group(1))))
 
     if not year_events:
         return []  # 연도 없으면 기간 미지정(분기 단독은 현행 유지)
 
     # 연도/분기 이벤트를 위치 순서로 병합해 슬롯을 만든다.
-    events = [(pos, "year", val) for pos, val in year_events] + \
-             [(pos, "quarter", val) for pos, val in quarter_events]
-    events.sort(key=lambda e: e[0])
+    events = [(s, e, "year", val) for s, e, val in year_events] + \
+             [(s, e, "quarter", val) for s, e, val in quarter_events]
+    events.sort(key=lambda ev: ev[0])
 
-    slots: list[dict] = []  # 각 원소 {"year": int, "quarter": int | None}
+    slots: list[dict] = []  # 각 원소 {"year", "quarter", "year_start", "year_end"}
     current_year: int | None = None
-    orphan_quarters: list[int] = []  # 아직 연도가 안 나온 시점에 등장한 분기(예: "1분기 2025년")
-    for _pos, kind, val in events:
+    orphan_quarters: list[tuple[int, int, int]] = []  # 연도 없이 먼저 온 분기(start,end,val)
+    for s, e, kind, val in events:
         if kind == "year":
             current_year = val
-            slots.append({"year": val, "quarter": None})
+            slots.append({"year": val, "quarter": None, "year_start": s, "year_end": e})
         else:  # quarter
             if slots and slots[-1]["quarter"] is None:
                 slots[-1]["quarter"] = val
             elif current_year is not None:
-                slots.append({"year": current_year, "quarter": val})
+                slots.append({"year": current_year, "quarter": val, "year_start": s, "year_end": e})
             else:
                 # 연도가 아직 없는데 분기가 먼저 왔다(부자연스러운 "1분기 2025년" 순서).
                 # 버리지 않고 모아 뒤의 bare 연도에 공유 분기로 붙인다 — _parse_period가
                 # 순서 무관하게 첫 연도+첫 분기를 짝짓는 것과 동작을 일치시킨다(회귀-안전).
-                orphan_quarters.append(val)
+                orphan_quarters.append((s, e, val))
 
-    # 공유 분기 백필: bare 연도 슬롯이 남았고 명시된 분기(고아 포함)가 정확히 하나면 공유한다.
+    # 공유 분기 백필: bare 연도 슬롯이 남았고 명시된 분기(고아 포함)가 정확히 하나면,
+    # "인접 연도 슬롯 사이의 원문이 순수 접속사뿐인" bare 슬롯에만 공유한다(위 docstring
+    # 참고 — 연도 사이에 지표명 등 실질 단어가 끼면 그 해는 이미 완결된 절이므로 공유 안 함).
     distinct_quarters = {s["quarter"] for s in slots if s["quarter"] is not None}
-    distinct_quarters |= set(orphan_quarters)
+    distinct_quarters |= {v for _s, _e, v in orphan_quarters}
     has_bare = any(s["quarter"] is None for s in slots)
     if has_bare and len(distinct_quarters) == 1:
         shared = next(iter(distinct_quarters))
-        for s in slots:
-            if s["quarter"] is None:
+        for i, s in enumerate(slots):
+            if s["quarter"] is not None:
+                continue
+            neighbors = []
+            if i + 1 < len(slots):
+                neighbors.append((s["year_end"], slots[i + 1]["year_start"]))
+            if i - 1 >= 0:
+                neighbors.append((slots[i - 1]["year_end"], s["year_start"]))
+            if not neighbors:
+                # 인접 연도가 없는 고립된 bare 슬롯(예: 고아 분기만 있는 경우) — 기존처럼 공유.
+                s["quarter"] = shared
+                continue
+            if any(_is_gap_pure_conjunction(q, gs, ge, quarter_events) for gs, ge in neighbors):
                 s["quarter"] = shared
 
     periods: list[dict] = []
@@ -1527,8 +1572,13 @@ def _answer_kr_multi_entity_question(
                     entity["financial"] = financial
 
         if intent in ("price", "both"):
+            # period가 명시됐으면(예: "25년 기준") 그 시점 이하 최근 거래일 종가를 가져온다
+            # (_resolve_screening_asof가 quarter/annual→날짜로 변환) — 재무 쪽만 과거 시점을
+            # 반영하고 가격은 항상 오늘 최신값을 보여줘 서로 다른 기준시점이 뒤섞이던 버그
+            # 수정. period가 None이면 asof=None → get_price_snapshot_kr 기존 최신값 경로.
+            price_asof = _resolve_screening_asof(period, conn, "prices", execute_sql_fn)
             price, err = _call_with_retry(
-                lambda c=code: price_snapshot_fn(conn, c, indicators=indicators)
+                lambda c=code: price_snapshot_fn(conn, c, asof=price_asof, indicators=indicators)
             )
             if err:
                 entity["errors"].append(f"주가데이터 조회 실패: {err}")
@@ -1827,8 +1877,12 @@ def answer_kr_question(
                 result["financial"] = financial
 
     if intent in ("price", "both"):
+        # period가 명시됐으면 그 시점 이하 최근 거래일 종가를 가져온다(다중종목 경로와
+        # 동일 원칙 — 재무 쪽만 과거 시점 반영하고 가격은 항상 오늘 최신값이라 서로 다른
+        # 기준시점이 뒤섞이던 버그 수정). period가 None이면 asof=None → 기존 최신값 경로.
+        price_asof = _resolve_screening_asof(period, conn, "prices", execute_sql_fn)
         price, err = _call_with_retry(
-            lambda: price_snapshot_fn(conn, stock_code, indicators=indicators)
+            lambda: price_snapshot_fn(conn, stock_code, asof=price_asof, indicators=indicators)
         )
         if err:
             result["errors"].append(f"주가데이터 조회 실패: {err}")

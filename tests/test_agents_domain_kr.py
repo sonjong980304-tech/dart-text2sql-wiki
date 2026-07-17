@@ -837,6 +837,19 @@ def test_parse_periods_empty_when_no_year():
     assert _parse_periods("삼성전자 1분기 영업이익") == []
 
 
+def test_parse_periods_no_share_when_metric_repeated_between_years():
+    # 실서버 재현 버그: "25년 영업이익률과 26년 1분기 영업이익률"은 지표명이 각 절마다
+    # 반복돼("25년 영업이익률" + "26년 1분기 영업이익률") 두 연도가 서로 다른 기간 타입을
+    # 독립적으로 지목한 것이다. 연도 사이가 순수 접속사("과 ")뿐인
+    # test_parse_periods_shared_quarter_across_two_years와 달리, 여기는 연도 사이에
+    # "영업이익률과"라는 실질 단어가 끼어 있어 공유하면 안 된다 — 앞의 25년은 연간으로
+    # 남아야 한다(수정 전에는 [2025Q1, 2026Q1]로 잘못 공유되어 2025Q1 값을 돌려주고 있었다).
+    assert _parse_periods("SK하이닉스 25년 영업이익률과 26년 1분기 영업이익률") == [
+        {"kind": "annual", "year": 2025},
+        {"kind": "quarter", "quarter": "2026Q1"},
+    ]
+
+
 # ── 지표 파싱(_extract_metric) — 회귀: "영업이익률"(비율)이 "영업이익"(금액)으로 오매핑 ─────
 # 실서버 재현 버그: "하이닉스 …영업이익률" 질문에서 _extract_metric이 부분문자열 "영업이익"을
 # 먼저 매치해 operating_profit(원본 계정 금액)을 뽑았다. operating_margin은 METRIC_SOURCE_MAP에
