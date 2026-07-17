@@ -202,6 +202,48 @@ def test_find_stock_code_handles_quote_injection_attempt_safely(tmp_path):
     assert count == 1  # DB 손상 없음
 
 
+def test_find_stock_code_does_not_treat_price_amount_as_code(tmp_path):
+    """회귀(리뷰 지적 (c)): '삼성전자 200000원 돌파했어?'의 '200000'은 주가 금액이지
+    종목코드가 아니다 — 6자리 숫자를 무조건 코드로 취급하면 엉뚱한 종목을 조회한다.
+    통화 단위 '원'이 붙은 6자리 숫자는 종목코드 후보에서 제외하고 회사명 매칭으로 넘어간다."""
+    db = _seed(tmp_path)  # 삼성전자 = 005930
+    conn = connect_readonly(db)
+    try:
+        for q in (
+            "삼성전자 200000원 돌파했어?",
+            "삼성전자 100000원 넘었어?",
+            "삼성전자 주가 500000원 이상이야?",
+            "삼성전자 300000원 이하로 떨어졌어?",
+        ):
+            assert find_stock_code(conn, q) == "005930", q
+    finally:
+        conn.close()
+
+
+def test_find_stock_codes_excludes_price_amount_from_candidates(tmp_path):
+    """find_stock_codes도 '…원' 금액을 코드 후보에서 빼야 한다 — 안 그러면 가짜 코드가
+    섞여 다중종목 경로로 잘못 분기된다(['200000','005930']로 2개 판정 → 다중종목 오분기)."""
+    db = _seed(tmp_path)
+    conn = connect_readonly(db)
+    try:
+        codes = find_stock_codes(conn, "삼성전자 200000원 돌파했어?")
+    finally:
+        conn.close()
+    assert codes == ["005930"]
+
+
+def test_find_stock_code_still_recognizes_genuine_six_digit_code(tmp_path):
+    """회귀: 진짜 종목코드(원이 붙지 않은 6자리)는 그대로 인식한다. 코드와 금액이 섞여 있으면
+    금액('…원')은 버리고 코드를 고른다."""
+    db = _seed(tmp_path)
+    conn = connect_readonly(db)
+    try:
+        assert find_stock_code(conn, "005930 주가 알려줘") == "005930"
+        assert find_stock_code(conn, "005930 200000원 돌파?") == "005930"
+    finally:
+        conn.close()
+
+
 def test_find_stock_code_goes_through_execute_sql(tmp_path, monkeypatch):
     """execute_sql이 실제로 호출되는지 monkeypatch 스파이로 검증한다."""
     import src.agents.domain_kr as mod
@@ -1166,3 +1208,33 @@ def test_answer_kr_question_recent_months_failure_reported_without_raising(tmp_p
     assert result["intent"] == "financial"
     assert result["financial"] is None
     assert any("boom" in e for e in result["errors"])
+
+
+def test_answer_kr_question_multi_entity_recent_months_return_routes_to_price_return_fn(tmp_path):
+    """회귀(리뷰 지적 (a)): 다중종목 '최근 N개월 수익률'도 단일종목과 동일하게 결정론
+    price_return_fn으로 종목별 계산되어야 한다. 예전엔 다중종목 경로에 이 처리가 빠져
+    _extract_metric이 임의 개월수를 못 잡아 종목마다 '재무 지표를 인식하지 못함'만 남고
+    결정론 계산이 통째로 빠졌다(LLM 자유 코드생성 폴백으로 새는 실패 패턴의 원인)."""
+    db = _seed_two_companies(tmp_path)  # prices 최신 거래일 = 2026-07-15
+    calls: list[tuple] = []
+
+    def fake_price_return(conn, code, asof, months):
+        calls.append((code, asof, months))
+        return {"stock_code": code, "months": months, "return_pct": 20.0}
+
+    conn = connect_readonly(db)
+    try:
+        result = answer_kr_question(
+            "삼성전자와 SK하이닉스 최근 6개월 수익률", conn, price_return_fn=fake_price_return
+        )
+    finally:
+        conn.close()
+
+    assert {c[0] for c in calls} == {"005930", "000660"}
+    assert all(c[2] == 6 for c in calls)          # 6개월
+    assert all(c[1] == "2026-07-15" for c in calls)  # asof = 최신 거래일
+    assert result["intent"] == "financial"
+    by_code = {e["stock_code"]: e for e in result["entities"]}
+    assert by_code["005930"]["financial"]["return_pct"] == pytest.approx(20.0)
+    assert by_code["000660"]["financial"]["months"] == 6
+    assert all(e["errors"] == [] for e in result["entities"])

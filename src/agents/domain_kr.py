@@ -35,7 +35,23 @@ from src.version import quarter_end_date
 # _screening_prompt는 KR/US 공용 함수(domain_us.py가 그대로 import해 재사용)라 두 도메인의
 # 지표 설명 단일 정의처(canonical source)를 모두 여기서 갖고 있다가 domain 인자로 고른다.
 
-_STOCK_CODE_RE = re.compile(r"\d{6}")
+# 종목코드는 정확히 6자리 숫자 하나(더 긴 숫자열의 일부가 아님) — 앞뒤에 다른 숫자가
+# 붙지 않은 경우만 인정한다("1200000원"처럼 7자리 금액에서 6자리 부분을 코드로 오려내지 않게).
+_STOCK_CODE_RE = re.compile(r"(?<!\d)\d{6}(?!\d)")
+# 바로 뒤에 통화 단위 '원'이 붙은 6자리 숫자는 주가/금액이지 종목코드가 아니다
+# ("삼성전자 200000원 돌파했어?"의 200000). 종목코드를 "005930원"처럼 쓰는 경우는 없다.
+_PRICE_WON_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)\s*원")
+
+
+def _stock_code_candidates(text: str) -> list[str]:
+    """질문에서 종목코드로 볼 수 있는 6자리 숫자만 순서대로 추린다(주가 금액 '…원'은 제외).
+
+    6자리 숫자를 무조건 종목코드로 취급하면 "200000원 돌파"의 금액을 엉뚱한 종목코드로
+    오인한다 — 통화 단위 '원'이 붙은 6자리 숫자는 후보에서 뺀다. 코드와 금액이 섞여 있으면
+    ("005930 200000원 돌파?") 금액만 빠지고 진짜 코드는 남는다.
+    """
+    price_amounts = set(_PRICE_WON_RE.findall(text))
+    return [m for m in _STOCK_CODE_RE.findall(text) if m not in price_amounts]
 
 # 지표명(한국어) → METRIC_SOURCE_MAP(src/agents/data_financial.py) 키. 질문에서 흔히
 # 쓰이는 한국어 표현만 최소한으로 다룬다(복잡한 NL 파싱은 이 에이전트의 책임이 아님).
@@ -89,9 +105,9 @@ def find_stock_code(
     """
     execute_sql_fn = execute_sql_fn or execute_sql
     text = question or ""
-    code_match = _STOCK_CODE_RE.search(text)
-    if code_match:
-        return code_match.group(0)
+    candidates = _stock_code_candidates(text)
+    if candidates:
+        return candidates[0]
     if not text.strip():
         return None
     escaped = _escape_sql_literal(text)
@@ -128,7 +144,7 @@ def find_stock_codes(
     execute_sql_fn = execute_sql_fn or execute_sql
     text = question or ""
 
-    codes: list[str] = list(dict.fromkeys(_STOCK_CODE_RE.findall(text)))
+    codes: list[str] = list(dict.fromkeys(_stock_code_candidates(text)))
 
     if text.strip():
         escaped = _escape_sql_literal(text)
@@ -209,7 +225,12 @@ _SCREEN_METRIC_ALIASES: dict[str, str] = {
     # 절대 인식하지 못한다(실서버 재현 버그: "삼성전자 투하자본수익률" 결정론적 실패).
     "투하자본수익률": "roc", "roc": "roc",
     "이익수익률": "earnings_yield", "ey": "earnings_yield",
-    "매출총이익률": "gp_a", "gpa": "gp_a", "gp/a": "gp_a",
+    # 매출총이익률(=매출총이익÷매출액)은 GPA(gp_a=매출총이익÷총자산)와 분모가 다른 별개 지표다.
+    # 과거엔 '매출총이익률'을 gp_a로 잘못 매핑했으나, 이제 별도 gross_margin 지표가 생겨 교정한다.
+    # GPA 자체는 'gpa'/'gp/a' 별칭으로만 지목한다(한국어 '매출총이익률'은 gross_margin으로).
+    "매출총이익률": "gross_margin",
+    "매출원가율": "cogs_ratio",
+    "gpa": "gp_a", "gp/a": "gp_a",
     # "시가총액 상위 N개" 스크리닝이 LLM 없이(휴리스틱 폴백) 동작할 때도 인식되게 한다
     # (실서버 재현 버그: market_cap이 METRIC_FIELD_DESCRIPTIONS에 없어 "총자산"으로 잘못 매핑됨).
     "시가총액": "market_cap", "시총": "market_cap",
@@ -382,7 +403,7 @@ def _screening_prompt(
         "질문에서 조건만 추출해 JSON으로만 답하세요(설명/코드/SQL 금지).\n"
         '형식: {"criteria":[{"key":"<지표>","direction":"low|high"}],'
         f'"top_n":<정수>,"sectors":null,"{market_key}":null,"sector_neutral":false,'
-        '"both_extremes":false}\n'
+        '"both_extremes":false,"sector_neutral_compare":false}\n'
         f"사용 가능한 지표(key: 설명):\n{fields_block}\n"
         "direction: 낮을수록/저평가 우수면 low, 높을수록 우수면 high.\n"
         "top_n: 질문에 개수가 명시돼 있으면 그 숫자를, 명시돼 있지 않으면 10을, "
@@ -394,6 +415,9 @@ def _screening_prompt(
         "sector_neutral: 질문이 '섹터 중립화'/'업종 중립'/'섹터별로 정규화'/'섹터 편중을 없애고' "
         "처럼 섹터(업종) 간 비교 왜곡을 제거해 달라고 명시적으로 요구하면 true로, 그렇지 않으면 "
         "false로 설정하세요.\n"
+        "sector_neutral_compare: 질문이 '섹터중립화 전후를 비교'/'섹터중립 하고 안 하고 둘 다' "
+        "처럼 섹터중립화 전(원본)과 후(섹터중립) 결과를 한 번에 비교해 보여달라고 요구하면 "
+        "true로, 그렇지 않으면 false로 설정하세요.\n"
         f"{scope_line}"
         f"{market_rule}"
         f"{sector_hint}\n"
@@ -455,8 +479,9 @@ def _parse_screening_json(raw: str, domain: str = "KR") -> dict | None:
         "exchanges": None,
         "sector_neutral": _coerce_sector_neutral(data.get("sector_neutral")),
         # _coerce_sector_neutral은 이름과 달리 순수 bool 강제 변환("true"/1/yes 관대 수용)이라
-        # both_extremes 플래그에도 그대로 재사용한다(중복 정의 방지).
+        # both_extremes/sector_neutral_compare 플래그에도 그대로 재사용한다(중복 정의 방지).
         "both_extremes": _coerce_sector_neutral(data.get("both_extremes")),
+        "sector_neutral_compare": _coerce_sector_neutral(data.get("sector_neutral_compare")),
     }
     if domain == "US":
         spec["exchanges"] = data.get("exchanges") or None
@@ -505,6 +530,23 @@ def _detect_sector_neutral_keyword(question: str) -> bool:
     """질문 텍스트에 섹터 중립화 요구 표현이 있으면 True(결정론 휴리스틱 폴백용)."""
     q = (question or "").lower()
     return any(p in q for p in _SECTOR_NEUTRAL_PHRASES)
+
+
+# "섹터중립화 전/후를 한 번에 비교"(sector_neutral_compare) 감지용 비교 의도 표현.
+# 게이트: 섹터중립 키워드(_detect_sector_neutral_keyword)와 이 비교 의도 표현이 둘 다 있을
+# 때만 compare로 본다 — sector_neutral 자체의 과잉추론 방지 철학을 그대로 따라, 섹터중립
+# 키워드만 있고 비교 의도가 없으면(그냥 "섹터중립화해서 보여줘") compare는 False로 둔다.
+_SECTOR_NEUTRAL_COMPARE_PHRASES: tuple[str, ...] = (
+    "비교", "전후", "둘 다", "둘다", "동시에", "함께 보여", "같이 보여",
+)
+
+
+def _detect_sector_neutral_compare_keyword(question: str) -> bool:
+    """섹터중립 키워드 + 비교 의도 표현이 둘 다 있을 때만 True(결정론 이중 게이트)."""
+    q = (question or "").lower()
+    return _detect_sector_neutral_keyword(q) and any(
+        p in q for p in _SECTOR_NEUTRAL_COMPARE_PHRASES
+    )
 
 
 def _heuristic_screening_spec(question: str, domain: str = "KR") -> dict | None:
@@ -573,6 +615,7 @@ def _heuristic_screening_spec(question: str, domain: str = "KR") -> dict | None:
         "exchanges": exchanges,
         "sector_neutral": _detect_sector_neutral_keyword(q),
         "both_extremes": both_extremes,
+        "sector_neutral_compare": _detect_sector_neutral_compare_keyword(q),
     }
 
 
@@ -678,6 +721,7 @@ def _normalize_override_spec(raw: dict) -> dict | None:
         "exchanges": raw.get("exchanges") or None,
         "sector_neutral": _coerce_sector_neutral(raw.get("sector_neutral")),
         "both_extremes": _coerce_sector_neutral(raw.get("both_extremes")),
+        "sector_neutral_compare": _coerce_sector_neutral(raw.get("sector_neutral_compare")),
     }
 
 
@@ -718,7 +762,7 @@ def _run_screening(
     result: dict = {
         "question": question, "intent": "screening",
         "criteria": None, "top_n": None, "sectors": None, "markets": None, "exchanges": None,
-        "sector_neutral": False, "both_extremes": False,
+        "sector_neutral": False, "both_extremes": False, "sector_neutral_compare": False,
         "asof": None, "result": None, "errors": [],
     }
 
@@ -773,6 +817,17 @@ def _run_screening(
     # on_progress detail(spec 그대로 노출)이 항상 이 최종값 하나만 보게 만들어, 두 곳이
     # 서로 다른(게이트 전/후) 값을 따로 참조하는 재발을 막는다.
     result["sector_neutral"] = spec["sector_neutral"]
+    # sector_neutral_compare도 동일한 이중 게이트를 적용한다 — override(사람이 직접 편집)는
+    # 그대로 신뢰하되, LLM/휴리스틱 추출 경로는 질문 원문에 섹터중립 키워드 + 비교 의도가
+    # 둘 다 실제로 있을 때만(_detect_sector_neutral_compare_keyword) 최종 true로 인정한다.
+    if override_spec is not None:
+        spec["sector_neutral_compare"] = spec.get("sector_neutral_compare", False)
+    else:
+        spec["sector_neutral_compare"] = (
+            spec.get("sector_neutral_compare", False)
+            and _detect_sector_neutral_compare_keyword(question)
+        )
+    result["sector_neutral_compare"] = spec["sector_neutral_compare"]
 
     if on_progress:
         on_progress(
@@ -798,35 +853,57 @@ def _run_screening(
     market_filter = spec.get("exchanges") if domain == "US" else spec.get("markets")
 
     sector_neutral = spec.get("sector_neutral", False)
+    compare = result["sector_neutral_compare"]
+
+    def _combine(criteria: list[dict], sn: bool):
+        return combine_fn(
+            rows, criteria, method="zscore",
+            n=spec["top_n"], sectors=requested_sectors, markets=market_filter,
+            sector_neutral=sn,
+        )
+
+    def _extreme_criteria() -> tuple[list[dict], list[dict]]:
+        # both_extremes: criteria가 한쪽 direction만 담겨 와도 key 기준으로 high/low를 재조립한다.
+        keys: list[str] = []
+        for c in spec["criteria"]:
+            if c["key"] not in keys:
+                keys.append(c["key"])
+        return (
+            [{"key": k, "direction": "high", "weight": 1.0} for k in keys],
+            [{"key": k, "direction": "low", "weight": 1.0} for k in keys],
+        )
+
     try:
-        if result["both_extremes"]:
+        if result["both_extremes"] and compare:
+            # 4-way 중첩: (최댓값/최솟값) × (섹터중립 전=raw / 후=sector_neutral)를 모두 계산한다.
+            high_criteria, low_criteria = _extreme_criteria()
+            selected = {
+                "highest": {
+                    "raw": _combine(high_criteria, False),
+                    "sector_neutral": _combine(high_criteria, True),
+                },
+                "lowest": {
+                    "raw": _combine(low_criteria, False),
+                    "sector_neutral": _combine(low_criteria, True),
+                },
+            }
+        elif compare:
+            # 섹터중립화 전(raw=원본)과 후(sector_neutral)를 한 번에 나란히 담아 비교한다.
+            selected = {
+                "raw": _combine(spec["criteria"], False),
+                "sector_neutral": _combine(spec["criteria"], True),
+            }
+        elif result["both_extremes"]:
             # "최댓값과 최솟값 둘 다": 같은 지표를 가중합으로 섞으면(combine의 zscore) 의도와
             # 달라지므로, 지표 key만 뽑아 direction=high(최댓값)와 low(최솟값)로 각각 top_n=1
             # combine을 따로 호출해 highest/lowest로 나란히 담는다. criteria가 한쪽 direction만
             # 담겨 와도 양쪽 다 재구성되도록 key 기준으로 재조립한다(LLM 응답 견고성).
-            keys: list[str] = []
-            for c in spec["criteria"]:
-                if c["key"] not in keys:
-                    keys.append(c["key"])
-            high_criteria = [{"key": k, "direction": "high", "weight": 1.0} for k in keys]
-            low_criteria = [{"key": k, "direction": "low", "weight": 1.0} for k in keys]
-            highest = combine_fn(
-                rows, high_criteria, method="zscore",
-                n=spec["top_n"], sectors=requested_sectors, markets=market_filter,
-                sector_neutral=sector_neutral,
-            )
-            lowest = combine_fn(
-                rows, low_criteria, method="zscore",
-                n=spec["top_n"], sectors=requested_sectors, markets=market_filter,
-                sector_neutral=sector_neutral,
-            )
+            high_criteria, low_criteria = _extreme_criteria()
+            highest = _combine(high_criteria, sector_neutral)
+            lowest = _combine(low_criteria, sector_neutral)
             selected = {"highest": highest, "lowest": lowest}
         else:
-            selected = combine_fn(
-                rows, spec["criteria"], method="zscore",
-                n=spec["top_n"], sectors=requested_sectors, markets=market_filter,
-                sector_neutral=sector_neutral,
-            )
+            selected = _combine(spec["criteria"], sector_neutral)
     except ValueError as exc:  # _validate_criteria_keys 등: 존재하지 않는 필드명(환각) 포함
         result["errors"].append(f"스크리닝 조건 오류: {exc}")
         return result
@@ -1173,6 +1250,7 @@ def _answer_kr_multi_entity_question(
     execute_sql_fn: Callable,
     indicators: list[dict] | None,
     computed_metric_fn: Callable,
+    price_return_fn: Callable,
 ) -> dict:
     """한 질문이 이름으로 지목한 여러 종목(예: "삼성전자와 SK하이닉스 종가") 각각에 답한다.
 
@@ -1183,6 +1261,36 @@ def _answer_kr_multi_entity_question(
     """
     base_question = _strip_retry_feedback(question)
     period = _parse_period(base_question)
+
+    # "최근 N개월/N년 수익률"은 단일종목 경로(answer_kr_question)와 동일하게 결정론 함수
+    # (price_return_fn)로 종목별 계산한다. 이 처리가 다중종목 경로에 빠져 있으면 _extract_metric이
+    # 12가 아닌 임의 개월수를 못 잡아 종목마다 "재무 지표를 인식하지 못함"으로 실패하고,
+    # 상위(총괄)에서 LLM 자유 코드생성 폴백으로 새어 8년 전 데이터로 틀린 답을 내던 회귀를 막는다.
+    recent_months = _parse_recent_return_months(base_question)
+    if recent_months is not None:
+        asof = _default_screening_asof(conn, "prices", execute_sql_fn)
+        entities = []
+        for code in stock_codes:
+            entity: dict = {"stock_code": code, "financial": None, "price": None, "errors": []}
+            financial, err = _call_with_retry(
+                lambda c=code: price_return_fn(conn, c, asof, recent_months)
+            )
+            if err:
+                entity["errors"].append(f"기간 수익률 계산 실패: {err}")
+            else:
+                entity["financial"] = financial
+            entities.append(entity)
+        return {
+            "stock_code": None,
+            "stock_codes": stock_codes,
+            "question": question,
+            "intent": "financial",
+            "financial": None,
+            "price": None,
+            "entities": entities,
+            "errors": [],
+        }
+
     intent = classify_intent(question, llm_fn=llm_fn)
     metric = _extract_metric(question) if intent in ("financial", "both") else None
 
@@ -1312,7 +1420,7 @@ def answer_kr_question(
             question, conn, multi_codes, llm_fn=llm_fn,
             resolve_metric_fn=resolve_metric_fn, price_snapshot_fn=price_snapshot_fn,
             execute_sql_fn=execute_sql_fn, indicators=indicators,
-            computed_metric_fn=computed_metric_fn,
+            computed_metric_fn=computed_metric_fn, price_return_fn=price_return_fn,
         )
 
     stock_code = find_stock_code(conn, question, execute_sql_fn=execute_sql_fn)

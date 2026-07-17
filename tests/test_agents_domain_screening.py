@@ -930,3 +930,184 @@ def test_answer_us_screening_both_extremes_symmetric():
     assert result["both_extremes"] is True
     assert [r["name"] for r in result["result"]["highest"]] == ["고PER다"]
     assert [r["name"] for r in result["result"]["lowest"]] == ["저PER가"]
+
+
+# ── 섹터중립 비교(sector_neutral_compare) — 섹터중립화 전/후를 한 번에 비교 ─────────────
+# 배경: 섹터중립 스크리닝은 sector_neutral 이중 게이트(LLM/휴리스틱이 True여도 질문 원문에
+# 실제 표현이 없으면 무시)로 과잉추론을 막는다. 사용자가 "섹터중립화 전후를 한 번에 비교"를
+# 요청해, both_extremes(최고/최저 동시)와 같은 패턴으로 raw/sector_neutral 두 결과를 나란히
+# 담는 sector_neutral_compare를 추가한다. 게이트: 섹터중립 키워드 + 비교 의도 둘 다 있을 때만 True.
+
+def test_detect_sector_neutral_compare_keyword_gate():
+    # 섹터중립 키워드 + 비교 의도 → True
+    assert kr._detect_sector_neutral_compare_keyword("섹터중립화 전후 비교해서 보여줘")
+    assert kr._detect_sector_neutral_compare_keyword("섹터중립화하고 안 하고 둘 다 보여줘")
+    assert kr._detect_sector_neutral_compare_keyword("섹터중립 동시에 같이 보여줘")
+    # 섹터중립 키워드만(비교 의도 없음) → False
+    assert not kr._detect_sector_neutral_compare_keyword("섹터중립화해서 보여줘")
+    # 비교 의도만(섹터중립 키워드 없음) → False
+    assert not kr._detect_sector_neutral_compare_keyword("PBR 낮은 10개 비교해줘")
+
+
+def test_screening_prompt_mentions_sector_neutral_compare():
+    prompt = kr._screening_prompt("아무 질문", kr._KR_SCREEN_FIELDS, (), domain="KR")
+    assert "sector_neutral_compare" in prompt
+
+
+def test_parse_screening_json_extracts_sector_neutral_compare():
+    spec = kr._parse_screening_json(json.dumps({
+        "criteria": [{"key": "per", "direction": "low"}], "top_n": 5, "sector_neutral_compare": True,
+    }), domain="KR")
+    assert spec is not None
+    assert spec.get("sector_neutral_compare") is True
+
+
+def test_heuristic_screening_spec_sector_neutral_compare_gate():
+    # 키워드+비교 의도 → True
+    spec = kr._heuristic_screening_spec("PER 섹터중립화 전후 비교해줘", domain="KR")
+    assert spec is not None
+    assert spec.get("sector_neutral_compare") is True
+    # 키워드만(비교 의도 없음) → False, sector_neutral만 True
+    spec2 = kr._heuristic_screening_spec("PER 섹터중립화해서 보여줘", domain="KR")
+    assert spec2 is not None
+    assert spec2.get("sector_neutral_compare") is False
+    assert spec2.get("sector_neutral") is True
+    # 섹터중립 키워드 없음(비교만) → False
+    spec3 = kr._heuristic_screening_spec("PBR 낮은 10개 비교해줘", domain="KR")
+    assert spec3 is not None
+    assert spec3.get("sector_neutral_compare") is False
+
+
+def test_normalize_override_spec_trusts_sector_neutral_compare_ungated():
+    # 사람이 명시적으로 재실행한 값이므로 게이트 없이 그대로 신뢰(sector_neutral/both_extremes 패턴).
+    spec = kr._normalize_override_spec({
+        "criteria": [{"key": "per", "direction": "low"}], "top_n": 5, "sector_neutral_compare": True,
+    })
+    assert spec is not None
+    assert spec.get("sector_neutral_compare") is True
+
+
+def test_answer_kr_screening_sector_neutral_compare_true_when_keyword_and_intent():
+    llm = _json_llm({
+        "criteria": [{"key": "per", "direction": "low"}], "top_n": 10, "sector_neutral_compare": True,
+    })
+    result = answer_kr_screening(
+        "PER 낮은 10개를 섹터중립화 전후로 비교해서 보여줘", conn=None, llm_fn=llm,
+        cross_section_fn=_fake_rows, asof="2026-07-14",
+    )
+    assert result["sector_neutral_compare"] is True
+
+
+def test_answer_kr_screening_sector_neutral_compare_false_without_compare_intent():
+    # 섹터중립 키워드만 있고 비교 의도 없음 → compare=False, sector_neutral만 True(과잉추론 방지).
+    llm = _json_llm({
+        "criteria": [{"key": "per", "direction": "low"}], "top_n": 10,
+        "sector_neutral": True, "sector_neutral_compare": True,
+    })
+    result = answer_kr_screening(
+        "PER 낮은 10개 섹터중립화해서 보여줘", conn=None, llm_fn=llm,
+        cross_section_fn=_fake_rows, asof="2026-07-14",
+    )
+    assert result["sector_neutral_compare"] is False
+    assert result["sector_neutral"] is True
+
+
+def test_answer_kr_screening_sector_neutral_compare_false_without_sector_neutral_keyword():
+    # "비교"라는 단어는 있지만 섹터중립 키워드 부재 → 게이트 차단으로 False.
+    llm = _json_llm({
+        "criteria": [{"key": "pbr", "direction": "low"}], "top_n": 10, "sector_neutral_compare": True,
+    })
+    result = answer_kr_screening(
+        "PBR 낮은 10개 비교해줘", conn=None, llm_fn=llm,
+        cross_section_fn=_fake_rows, asof="2026-07-14",
+    )
+    assert result["sector_neutral_compare"] is False
+
+
+def test_answer_kr_screening_compare_returns_raw_and_sector_neutral():
+    llm = _json_llm({
+        "criteria": [{"key": "per", "direction": "low"}], "top_n": 2, "sector_neutral_compare": True,
+    })
+    result = answer_kr_screening(
+        "PER 낮은 2개 섹터중립화 전후 비교", conn=None, llm_fn=llm,
+        cross_section_fn=_fake_rows, asof="2026-07-14",
+    )
+    assert result["errors"] == []
+    assert result["sector_neutral_compare"] is True
+    assert isinstance(result["result"], dict)
+    assert set(result["result"].keys()) == {"raw", "sector_neutral"}
+    # raw(섹터중립 안 함)는 기존 단일 스크리닝과 동일한 결과여야 한다.
+    assert [r["name"] for r in result["result"]["raw"]] == ["저PER가", "중간나"]
+    assert isinstance(result["result"]["sector_neutral"], list)
+
+
+def test_answer_kr_screening_compare_heuristic_fallback_without_llm():
+    result = answer_kr_screening(
+        "PER 낮은 2개 섹터중립화 전후 비교", conn=None, llm_fn=None,
+        cross_section_fn=_fake_rows, asof="2026-07-14",
+    )
+    assert result["errors"] == []
+    assert result["sector_neutral_compare"] is True
+    assert set(result["result"].keys()) == {"raw", "sector_neutral"}
+    assert [r["name"] for r in result["result"]["raw"]] == ["저PER가", "중간나"]
+
+
+def test_answer_kr_screening_both_extremes_and_compare_four_way_nesting():
+    llm = _json_llm({
+        "criteria": [{"key": "per", "direction": "high"}, {"key": "per", "direction": "low"}],
+        "top_n": 1, "both_extremes": True, "sector_neutral_compare": True,
+    })
+    result = answer_kr_screening(
+        "PER의 최댓값과 최솟값을 섹터중립화 전후로 비교해서 보여줘", conn=None, llm_fn=llm,
+        cross_section_fn=_fake_rows, asof="2026-07-14",
+    )
+    assert result["errors"] == []
+    assert result["both_extremes"] is True
+    assert result["sector_neutral_compare"] is True
+    r = result["result"]
+    assert set(r.keys()) == {"highest", "lowest"}
+    assert set(r["highest"].keys()) == {"raw", "sector_neutral"}
+    assert set(r["lowest"].keys()) == {"raw", "sector_neutral"}
+    assert [x["name"] for x in r["highest"]["raw"]] == ["고PER다"]
+    assert [x["name"] for x in r["lowest"]["raw"]] == ["저PER가"]
+
+
+def test_answer_kr_screening_override_compare_trusted_without_keyword():
+    # override_spec은 게이트 없이 그대로 신뢰 → 질문에 키워드가 없어도 compare 실행.
+    result = answer_kr_screening(
+        "PER 낮은 2개", conn=None, llm_fn=None,
+        cross_section_fn=_fake_rows, asof="2026-07-14",
+        override_spec={
+            "criteria": [{"key": "per", "direction": "low"}], "top_n": 2,
+            "sector_neutral_compare": True,
+        },
+    )
+    assert result["errors"] == []
+    assert result["sector_neutral_compare"] is True
+    assert set(result["result"].keys()) == {"raw", "sector_neutral"}
+
+
+def test_answer_kr_screening_non_compare_result_shape_unchanged():
+    # 회귀: compare가 아니면 기존처럼 result는 평평한 list(구조 불변).
+    llm = _json_llm({"criteria": [{"key": "per", "direction": "low"}], "top_n": 2})
+    result = answer_kr_screening(
+        "PER 낮은 2개", conn=None, llm_fn=llm,
+        cross_section_fn=_fake_rows, asof="2026-07-14",
+    )
+    assert result["errors"] == []
+    assert result["sector_neutral_compare"] is False
+    assert isinstance(result["result"], list)
+
+
+def test_answer_us_screening_sector_neutral_compare_symmetric():
+    # 공용 _run_screening을 타므로 US 경로도 대칭 동작.
+    llm = _json_llm({
+        "criteria": [{"key": "per", "direction": "low"}], "top_n": 2, "sector_neutral_compare": True,
+    })
+    result = answer_us_screening(
+        "PER 낮은 2개 섹터중립화 전후 비교", conn=None, llm_fn=llm,
+        cross_section_fn=_fake_rows, asof="2026-07-14",
+    )
+    assert result["errors"] == []
+    assert result["sector_neutral_compare"] is True
+    assert set(result["result"].keys()) == {"raw", "sector_neutral"}
