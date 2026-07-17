@@ -6,6 +6,10 @@
 - **웹(`web/app.py`)**: 신규 **계층형 멀티에이전트** 구조. 총괄 에이전트가 한국주식/
   미국주식/매크로/백테스트 도메인으로 라우팅하고, 도메인 결과를 검증·재시도한 뒤
   종합 결론 + 도메인별 원본 데이터를 함께 반환합니다.
+- **기본 화면은 멀티턴 대화**(`/`, `/chat` → `chat.html`)입니다. 같은 총괄 에이전트를
+  재사용하되 대화 세션을 기억해 "그중에서 PBR 낮은 것만 다시 보여줘" 같은 후속 질문을
+  이어갈 수 있습니다(자세한 동작은 [멀티턴 대화](#멀티턴-대화-chat) 절 참고). 예전
+  단발 질의 화면은 `/query` → `index.html`로 그대로 남아 있습니다.
 
 
 > 키(OpenDART/OpenAI) 없이도 **더미 데이터 + 휴리스틱 폴백**으로 전체 파이프라인이 동작합니다.
@@ -105,6 +109,61 @@ flowchart TB
   LLM은 파이썬 코드를 직접 생성하지 않고, 사전검증된 프리미티브를 어떤 순서로 조립할지
   JSON으로만 지시합니다(같은 머신에 실거래봇이 상주하므로 임의 코드 실행을 차단).
 
+### 에이전트·도메인별 역할 (누가 무엇을 하는가)
+
+| 계층 | 파일 | 하는 일 |
+|---|---|---|
+| 총괄 | `supervisor.py` | `route_question`(질문을 보고 kr/us/macro/backtest 중 몇 개 도메인이 필요한지 결정 — LLM 우선, 실패 시 키워드 휴리스틱) → `dispatch_domains`(해당 도메인들을 호출해 원본 결과를 **가공 없이** 보존) → `verify_answer`(도메인 결과가 원래 질문에 실제로 답이 되는지 규칙+LLM으로 재확인) → 불일치면 실패 사유를 피드백해 **최대 3회**까지만 재도전 → `synthesize_conclusion`(종합 결론 문장 생성). 3회를 넘겨도 실패하면 그제서야 아래 exec_fallback을 정확히 1회 시도합니다. |
+| 도메인 | `domain_kr.py` | 국내 종목. 질문을 단일종목/다중종목(비교질문)/스크리닝(조건검색) 3갈래로 나눕니다. 스크리닝은 LLM이 "PER 낮은 순 10개"처럼 **조건(criteria)·개수(top_n)만 JSON으로 뽑고**, 실제 정렬·계산은 `get_cross_section`+`combine`이 결정론적으로 수행합니다(LLM이 숫자를 직접 계산하지 않음 — 계산은 항상 코드가, 판단만 LLM이). |
+| 도메인 | `domain_us.py` | 미국 종목. 티커 인식(`resolve_ticker_us`) 후 국내와 완전히 분리된 US 전용 테이블(`us_company`/`us_prices`/`us_financials`)을 조회합니다. |
+| 도메인 | `domain_macro.py` | **재계산을 하지 않습니다** — launchd로 매일 미리 계산·적재된 `macro_signal` 테이블의 최신 1행을 읽어오기만 합니다(질문이 들어올 때마다 신호를 다시 판정하면 매번 값이 흔들릴 수 있어, "판단은 배치로 1회, 조회는 캐시만"이라는 이 프로젝트 공통 원칙을 여기서도 씁니다). |
+| 도메인 | `domain_backtest.py` | 전략 백테스트·팩터분석(상관관계/분위수/히스토그램/QVM 등)을 담당합니다. LLM이 파이썬을 쓰지 않고 `{"pipeline":[{"op":..., "params":..., "out":...}]}` 형태의 **JSON 조립 지시서**만 생성하면(`generate_backtest_steps`), 그 JSON을 먼저 정적 검증(`validate_pipeline_steps` — 존재하지 않는 연산·파라미터 거부)한 뒤 `pipeline_exec.run_pipeline`이 실제 계산을 수행합니다. |
+| 데이터 | `data_price_kr.py` / `data_price_us.py` / `data_financial.py` | 최하위 계층. 도메인 에이전트가 필요로 하는 주가/재무 데이터를 실제로 조회해줍니다. DB에 직접 `conn.execute()`를 쓰지 않고 **반드시 `exec_runtime.execute_sql`을 경유**합니다 — 이렇게 하나의 통로로 강제해야 아래 "SQL/Python 실행" 절의 안전장치(읽기전용 연결, 스키마 사전검증, 타임아웃)를 모든 SQL 호출이 빠짐없이 통과합니다. `data_financial.py`의 `resolve_metric`은 DART/FnGuide 두 소스 중 어느 쪽 값인지, 어느 분기 값인지까지 함께 반환합니다. |
+
+### SQL/Python은 실제로 어떻게 실행되는가
+
+이 프로젝트는 "LLM이 만든 코드를 실행"하는 경로가 성격이 다른 **두 종류**로 나뉩니다. 왜
+나뉘어 있는지: 같은 macOS 머신에 실거래 자동매매 봇(`quant_trader`)이 함께 떠 있기 때문에,
+LLM이 만든 신뢰할 수 없는 코드가 그 프로세스나 데이터베이스에 영향을 줄 수 없도록 두 경로
+모두 각자의 방식으로 "울타리"를 쳐 두었습니다.
+
+1. **백테스트 파이프라인(`src/backtest/pipeline_exec.py`)** — LLM은 파이썬 코드를 아예
+   작성하지 않습니다. 대신 "어떤 연산을 어떤 파라미터로, 어떤 순서로 실행할지"를 JSON으로만
+   지시하고, 실행기가 그 연산 이름을 **고정된 딕셔너리(`PRIMITIVE_OPS`, 현재 26개 연산)**에서
+   찾아 실행합니다. `getattr()` 같은 "이름 문자열로 아무 함수나 찾아 호출하는" 방식은 코드
+   전체에서 금지되어 있습니다 — LLM이 딕셔너리에 없는 이름을 지어내면 그냥 실행 자체가
+   거부됩니다. 안전 상한도 하드코딩되어 있습니다: 파이프라인 단계 최대 20개, 한 번에 다루는
+   행 수 최대 4000개, 실행시간 최대 120초(호출자가 이보다 큰 값을 요청해도 무시됩니다).
+2. **자유 코드 실행기(`src/agents/exec_runtime.py`)** — 정형 경로로 답할 수 없는 질문을 위해
+   LLM이 SQL과 파이썬 코드를 **직접** 작성하는 경로(아래 "자유 코드 최후 폴백"과 멀티턴 대화의
+   "이어가기"가 이 경로를 씁니다)입니다. 대신 두 겹의 격리를 둡니다:
+   - `execute_sql`: LLM이 쓴 SQL은 **읽기전용 연결**(`connect_readonly`, sqlite의 `mode=ro`)에서만
+     실행됩니다 — SELECT가 아닌 문장이 섞여 들어와도 DB 엔진 자체가 "읽기전용 DB에 쓰기
+     시도"라는 에러로 거부합니다. 실행 전에 `EXPLAIN`으로 먼저 스키마를 검증해(존재하지 않는
+     테이블/컬럼이면 실제 데이터를 읽기 전에 즉시 에러), 무거운 풀스캔이 시작되기 전에
+     걸러냅니다. 120초가 지나면 진행 중인 쿼리를 `conn.interrupt()`로 실제로 중단시킵니다.
+   - `execute_python`: LLM이 쓴 파이썬 코드는 메인 서버 프로세스가 아니라 **완전히 별도의
+     자식 프로세스**(spawn 방식)에서 `exec()`로 실행됩니다. 문제가 생겨도 그 자식 프로세스
+     안에서만 터지고 메인 서버에는 영향이 없으며, 타임아웃(기본 120초)이 지나면
+     `process.kill()`로 실제 강제 종료합니다(스레드와 달리 "방치"되지 않고 확실히 죽습니다).
+     CPU 시간 상한(`RLIMIT_CPU`)도 추가로 걸어둡니다(메모리 상한은 macOS 커널이 지원하지
+     않아 시도만 하고 실패하면 조용히 넘어갑니다 — 리눅스에서는 정상 동작 예상). 코드가
+     결과 외에 `chart_base64` 같은 보조 값을 만들었으면 `extra_vars` 파라미터로 그 값도
+     함께 회수할 수 있습니다(히스토그램 등 차트 기능이 이 경로를 씁니다).
+
+### 자유 코드 최후 폴백 (`src/agents/exec_fallback.py`)
+
+정형 도메인 경로(스크리닝 조건 JSON, 백테스트 파이프라인 JSON 등)가 표현할 수 없는 질문
+— 예: "시장별로 나눠서 각각 상위 10개씩" 같은 복합 질문 — 은 검증을 아무리 반복해도
+같은 이유로 계속 실패합니다. `answer_with_verification`이 **정확히 3회** 재시도한 뒤에도
+실패하면, 그 다음엔 같은 검증을 다시 걸지 않고 딱 한 번 이 폴백을 시도합니다: LLM이 (1)
+필요한 원본 데이터를 넉넉히 가져오는 읽기전용 SELECT 하나, (2) 그 데이터를 원하는 모양으로
+가공하는 파이썬 코드 하나를 순서대로 작성하고, 둘 다 위 `exec_runtime.py`로 실행합니다.
+파이썬 코드가 실패하면 실패 사유를 다음 시도 프롬프트에 알려주는 자가수정 재시도를 최대
+2회까지 합니다. "결과가 비어있지 않은가"만 최소한으로 확인하고, 정형 검증 로직을 다시
+태우지는 않습니다(다시 태우면 애초에 정형 경로가 실패했던 것과 같은 이유로 또 실패할
+뿐이라 무의미합니다).
+
 ### 데이터 품질 안전장치
 스크리닝과 백테스트가 공유하는 데이터접근 계층(`src/backtest/data_access.py::metrics_at`,
 `data_access_us.py::metrics_at_us`)에 세 가지 안전장치가 걸려 있습니다. 셋 다 **"판단은
@@ -154,6 +213,106 @@ AI/API가 하되, 결과는 캐싱해 매 요청마다 재호출하지 않는다
 
 ---
 
+## 멀티턴 대화 (`/chat`)
+
+기본 화면입니다. "삼성전자 PBR 알려줘" 다음에 "그중에서 낮은 순으로 정렬해줘"처럼 대화를
+이어갈 수 있습니다. 핵심 모듈은 `src/agents/conversation.py`이고, 기존에 이미 검증된
+총괄 에이전트(`answer_with_verification`)를 새로 만들지 않고 그대로 재사용합니다.
+
+### 세션은 어떻게 유지되는가
+- 세션(`ConversationSession`)은 **서버 프로세스의 메모리(딕셔너리)에만** 존재합니다.
+  DB에 저장하지 않으므로 **서버를 재시작하면 대화 이력이 사라집니다** — 실수가 아니라
+  의도된 설계입니다(대화 자체가 휘발성 스크래치패드라는 전제).
+- 브라우저는 발급받은 `session_id`를 저장해두고 새로고침해도 같은 세션으로 이어갑니다.
+
+### 매 턴마다 "신규 조회"와 "이어가기" 중 무엇을 고르는가
+```
+세션에 데이터가 없다(첫 턴)
+  └─ 신규 조회: answer_with_verification 그대로 실행 (SQL 재조회 + 검증 + 3회 재시도 +
+     필요시 exec_fallback까지 자동)
+
+세션에 데이터가 있다
+  └─ 가볍게 LLM에게 "이번 질문이 직전 데이터를 이어서 가공하는 질문인가, 완전히 무관한
+     새 주제인가"만 판정시킴(CONTINUE/NEW 한 단어 응답)
+       ├─ CONTINUE → 이어가기: 직전 결과를 `data`라는 이름의 변수로 실행 컨텍스트에 주입하고
+       │   파이썬 코드만 새로 짜서 실행(SQL 재조회 없음, exec_runtime.execute_python 사용)
+       └─ NEW      → 신규 조회로 전환(직전 데이터는 버림)
+
+  이어가기가 실행 자체에 실패하면(코드 에러 등) → 분류가 틀렸을 가능성을 감안해
+  신규 조회로 한 번 더 자동 재시도합니다(사용자에게 원시 에러를 그대로 보여주지 않기 위함).
+```
+"이어서 가공"이라는 프롬프트에는 직전 데이터의 **실제 값은 넣지 않고 구조(행 수·컬럼명)만
+요약해서** 넣습니다 — 다만 코드가 실제로 실행될 때는 `data` 변수에 원본 전체가 정상적으로
+들어갑니다(프롬프트 절약 목적이지 데이터를 숨기는 게 아닙니다). 실패한 턴은 세션의 데이터를
+건드리지 않으므로, 다음 질문은 항상 "마지막으로 성공한 데이터"를 기준으로 이어집니다.
+
+### 화면 구성과 API
+3열 레이아웃입니다 — 왼쪽 대화 이력 사이드바(턴 클릭 시 가운데로 불러오기), 가운데
+최종 답변(+ 표 형태면 CSV 다운로드, 차트 요청 시 이미지), 오른쪽 실시간 처리상황(SSE) +
+그 턴의 근거 데이터(정형 도메인이 실제로 조회한 원본 결과, 자유 코드면 SQL/파이썬 전문)
+패널입니다.
+
+| 메서드 | 경로 | 설명 |
+|---|---|---|
+| POST | `/api/chat` | 턴 하나 실행(동기) |
+| GET | `/api/chat/stream` | 위와 동일 로직을 SSE로 실시간 스트리밍 (오른쪽 진행상황 패널용) |
+| POST | `/api/chat/reset` | 세션 초기화 — 누적 맥락을 버리고 처음부터 다시 시작 |
+| GET | `/api/chat/history` | 세션의 턴별 질문/답변/근거데이터 목록 |
+| GET | `/api/chat/csv` | 특정 턴의 결과를 CSV로 재다운로드(표 형태가 아니면 명확한 사유와 함께 실패) |
+
+## 최근 추가 기능 (히스토그램 · CSV 컬럼 필터링 · QVM 멀티팩터 전략)
+
+### 히스토그램(분포) 차트
+"코스피 PBR 분포 히스토그램 그려줘" 같은 질문에 답합니다. 계산은
+`primitives.py::histogram_buckets`(구간 경계·구간별 개수 계산)가 하고, 그림은
+`charting.py::render_histogram_chart_base64`가 그립니다. 두 경로에서 각각 다르게 연결됩니다:
+- **단발 질의(`/query`)**: `domain_backtest.py`가 만든 파이프라인 JSON에
+  `histogram_buckets`가 포함되면, `supervisor.py`가 그 결과 모양을 인식해(`_is_histogram_shape`)
+  자동으로 이미지를 붙입니다.
+- **멀티턴 대화(`/chat`)**: LLM이 짜는 파이썬 코드 안에서 `charting.py`의 렌더 함수를
+  직접 import해 호출하고, 결과 base64 문자열을 `chart_base64`라는 변수에 담습니다. 이
+  값을 실행기가 회수할 수 있도록 `exec_runtime.execute_python`에 `extra_vars` 옵션을
+  새로 추가했습니다(기존 호출부는 전혀 영향 없음 — 순수 추가).
+
+"PBR 히스토그램"처럼 "백테스트"라는 단어가 전혀 없는 질문이 엉뚱한 도메인(개별 종목 조회)
+으로 새지 않도록, `supervisor.py`의 라우팅 키워드에도 "히스토그램/분포도"를 추가했습니다.
+
+### 스크리닝 결과 CSV — 요청한 컬럼만 내려받기
+"PER 낮은 10개 종목"을 CSV로 받으면, 화면에는 여러 참고 필드가 함께 보여도 **CSV에는
+종목코드·종목명 + 실제 요청한 지표(PER)만** 남습니다. 스크리닝 결과가 이미 들고 있던
+`criteria`(요청 조건 목록)/`top_n` 메타데이터를 재사용해 컬럼을 걸러내며, 화면에 보이는
+원본 데이터(근거 데이터 패널)는 그대로 두고 **CSV로 내려받는 시점에만** 좁힙니다. 단발
+질의는 `index.html`의 `_screeningCsvColumns`가, 멀티턴 대화는 `conversation.py`의
+`_screening_csv_columns`가 같은 규칙으로 동작합니다. 스크리닝이 아닌 결과(단일 종목 조회,
+백테스트 결과 등 `criteria`가 없는 경우)는 지금까지처럼 전체 컬럼이 그대로 내려갑니다.
+
+### QVM(퀄리티·밸류·모멘텀) 멀티팩터 스크리너 + 백테스트
+"퀄리티 밸류 모멘텀 전략 상위 20개 뽑아줘" 또는 "QVM 전략으로 2024~2026년 분기 리밸런싱
+백테스트 해줘" 같은 질문에 답합니다. 별도 화면이나 API가 아니라, 기존 백테스트 도메인의
+파이프라인 JSON 조립 방식 그대로 동작합니다 — LLM이 `get_cross_section_qvm` →
+`compute_qvm_scores` → `combine`(또는 `run_qvm_backtest`) 순서의 JSON을 조립하면 실행됩니다.
+
+계산 순서(`primitives.py::compute_qvm_scores`, 사용자가 지정한 순서를 그대로 구현):
+1. **가치지표 역수 변환**: PER→E/P, PBR→B/P, PSR→S/P (낮을수록 좋은 지표를 높을수록
+   좋은 방향으로 통일)
+2. **윈저라이즈**: 각 원지표를 1%/99% 분위수 밖은 경계값으로 눌러 극단치 영향을 줄임
+   (기존 IQR 방식 `winsorize()`는 건드리지 않고 `winsorize_pct()`를 별도로 추가)
+3. **섹터중립 z-score**: 같은 업종끼리만 비교해 표준화(업종 표본이 5개 미만이면 전체
+   유니버스 기준으로 자동 대체)
+4. **카테고리 합성**: 퀄리티(ROE·GP/A·CFO비율)/밸류(E/P·B/P·S/P)/모멘텀(12-1개월) 3개
+   카테고리 각각 내부 팩터를 등가중 평균
+5. **결측 필터**: 원지표 7개 중 3개 이상 결측인 종목은 제외
+6. **2차 표준화**: 3개 카테고리 합성점수를 유니버스 전체로 다시 z-score
+7. **최종 점수** = (퀄리티_z + 밸류_z + 모멘텀_z) / 3
+
+모멘텀(12-1, 최근 12개월 수익률에서 최근 1개월을 제외한 값)은 전종목을 한 번에 조회해도
+느려지지 않도록 **배치 SQL**(`data_access.py::momentum_12_1_batch`)로 계산합니다 — 종목이
+5개든 3924개든 SQL 호출 횟수는 항상 2회로 고정되어 있어(종목 수만큼 반복 조회하지 않음),
+전종목 스크리닝이 느려지는 기존 성능 문제를 키우지 않습니다. 백테스트는 이미 안전성이
+검증된 백테스트 엔진(`engine.py`/`selection.py`/`performance.py`)을 전혀 수정하지 않고,
+매 리밸런싱 시점의 지표 계산 함수만 감싸 QVM 점수를 미리 얹어 넘기는 방식(`run_qvm_backtest`)
+으로 재사용합니다.
+
 ## 데이터 (SQLite, `data/market.db`)
 
 | 테이블 | 설명 |
@@ -172,6 +331,24 @@ AI/API가 하되, 결과는 캐싱해 매 요청마다 재호출하지 않는다
 | `wiki` | 질문·SQL·태그 등 **질의 기록 로그**(과거 유사도 캐시 기능은 폐기, 지금은 하위호환용) |
 | `result_cache` | (SQL해시 + data_version) → 결과 (legacy 파이프라인 전용) |
 | `ingest_meta` | 실제 공시된 최신 분기 / 최신 종가일 등 체크포인트 |
+
+### 데이터는 어디서 가져오는가 (출처 · 수집 방식)
+
+| 출처 | 가져오는 것 | 담기는 테이블 | 수집 방식 |
+|---|---|---|---|
+| [OpenDART](https://opendart.fss.or.kr) (전자공시시스템 Open API) | 국내 상장사 재무제표 원본(계정과목·금액) | `financials`, `raw_reports`(재파싱용 원본 보관) | API 키 발급 후 `src/ingest/dart.py`가 호출, 일일 조회 한도 안에서 증분 수집 |
+| FnGuide (웹페이지) | DART에 없는 컨센서스 전망치·목표주가 등 | `fnguide_metrics` | `src/ingest/fnguide_metrics.py`가 종목별 페이지를 크롤링(값이 다르면 항상 DART 우선) |
+| KRX 정보데이터시스템 | 업종분류(29개 표준 카테고리) | `company.sector` | `scripts/backfill_sector_krx.py`(계정 필요, 없으면 pykrx 업종분류 API가 403) |
+| pykrx + 네이버 금융 | 국내 종목 종가·시가총액 | `prices` | 두 소스를 병합해 하나의 테이블로 통일(`src/ingest/naver_prices.py` 등) |
+| NASDAQ 스크리너 + [yfinance](https://pypi.org/project/yfinance/) | 미국 종목 유니버스·주가·재무제표 | `us_company`, `us_prices`, `us_financials` | 국내와 완전히 분리된 별도 파이프라인(`src/ingest/us_*.py`) |
+| [Ken French Data Library](https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html) | 파마프렌치 팩터(Mkt-RF/SMB/HML/RMW/CMA/RF, 모멘텀) | (저장 안 함 — CLI 온디맨드 조회 전용) | `src/factors/fama_french.py`가 `pandas_datareader`로 질문 즉시 조회 |
+| FRED(장단기 금리차 T10Y2Y) · CNN Fear & Greed · VIX | 매크로 레짐 판정용 원지표 | `macro_indicators` → 판정 결과는 `macro_signal` | `scripts/run_macro_indicators.py`가 매일 수집 후 신호 재계산 |
+
+`data/market.db` 자체는 이 프로젝트가 직접 만드는 **1차 가공 결과물**입니다 — 위 출처들에서
+원본을 받아와 `src/ingest/normalize.py`(계정과목 정규화)·`src/ingest/metrics.py`(파생지표
+계산)를 거쳐 하나의 SQLite 파일로 통합해 저장합니다. 어떤 값이든 최종 답변에는 "어느
+출처에서, 어느 시점 값인지"가 함께 표시됩니다(DART/FnGuide 구분은 위 "재무 데이터 소스
+구분" 절 참고).
 
 **계정과목 정규화**(`src/ingest/normalize.py`): 회사별 비표준 표기를 표준 키로 매핑.
 예) `매출액` / `영업수익` / `수익(매출액)` / `매출` → `revenue`
@@ -234,8 +411,10 @@ uvicorn web.app:app --reload      # http://127.0.0.1:8000
 
 | 메서드 | 경로 | 설명 |
 |---|---|---|
-| POST | `/api/query` | 계층형 총괄 그래프 실행 → 종합결론 + 도메인별 원본결과 |
+| POST | `/api/query` | 계층형 총괄 그래프 실행 → 종합결론 + 도메인별 원본결과(단발 질의, `/query` 화면용) |
 | GET | `/api/query/stream` | 위와 동일 로직을 SSE로 실시간 스트리밍(진행 트리용) |
+| POST | `/api/query/rerun` | 사용자가 고친 조건JSON/파이프라인을 LLM 없이 결정론적으로 재실행(휴먼인더루프) |
+| POST | `/api/chat`, `GET /api/chat/stream`, `POST /api/chat/reset`, `GET /api/chat/history`, `GET /api/chat/csv` | 멀티턴 대화(`/chat` 화면용) — 자세한 동작은 [멀티턴 대화](#멀티턴-대화-chat) 절 참고 |
 | GET | `/api/models` | 선택 가능한 LLM 목록 + 가용성 |
 | GET/PUT/DELETE | `/api/wiki`, `/api/wiki/{id}` | 질의 기록 로그(하위호환 유지, 신규 질의는 자동 저장 안 함) |
 | GET | `/api/stats` | 기록 통계 |
@@ -244,9 +423,11 @@ uvicorn web.app:app --reload      # http://127.0.0.1:8000
 | GET | `/api/metric-defs`, `/api/sectors` | 백테스트 UI용 지표 정의 / 업종 목록 |
 | POST | `/api/backtest` | 백테스트 실행 |
 | GET | `/api/backtest-runs` | 저장된 백테스트 이력 |
-| GET | `/`, `/macro` | 메인 화면 / 매크로 전용 화면 |
+| GET | `/`, `/chat` | **기본 화면** — 멀티턴 대화(`chat.html`) |
+| GET | `/query` | 예전 단발 질의 화면(`index.html`, 실시간 트리 + 백테스트 UI 패널) |
+| GET | `/macro` | 매크로 전용 화면 |
 
-프론트(`/`): 질의 입력 + 실시간 트리(`🌳`) + 종합결론/도메인별 원본 데이터 + 백테스트
+프론트(`/query`): 질의 입력 + 실시간 트리(`🌳`) + 종합결론/도메인별 원본 데이터 + 백테스트
 패널(접이식, 산업 필터·조합방식·거래비용 등).
 
 ---
@@ -313,8 +494,11 @@ dart-text2sql-wiki/
 │   │   ├── data_financial.py      # DART/FnGuide 재무 데이터 에이전트
 │   │   ├── data_price_kr.py / data_price_us.py  # 주가·기술지표 데이터 에이전트
 │   │   ├── backtest_verification.py  # 하드차단 3종 + 소프트경고 4종 배선
-│   │   └── exec_runtime.py        # LLM 생성 SQL/파이썬 안전 실행기
-│   ├── backtest/              # engine, primitives, pipeline_exec, auditor, selection, chart 등
+│   │   ├── exec_runtime.py        # LLM 생성 SQL/파이썬 안전 실행기(읽기전용 conn + 별도 프로세스)
+│   │   ├── exec_fallback.py       # 정형 3회 실패 후 최후 1회 자유 코드 폴백
+│   │   ├── conversation.py        # 멀티턴 대화 세션(신규/이어가기 분기, 프로세스 메모리)
+│   │   └── charting.py            # 라인/산점도/막대/히스토그램 → base64 PNG
+│   ├── backtest/              # engine, primitives(26개 프리미티브, QVM 포함), pipeline_exec, auditor, selection 등
 │   ├── ingest/                # dart, krx, naver_prices, fnguide_metrics, us_*, macro_* 등
 │   ├── factors/fama_french.py # 파마프렌치 팩터 온디맨드 조회
 │   ├── wiki/store.py          # 질의 기록 로그
@@ -322,7 +506,7 @@ dart-text2sql-wiki/
 │   └── legacy/pipeline.py     # 예전 6노드 파이프라인 (이관 보관, cli.py가 사용)
 ├── web/
 │   ├── app.py                 # FastAPI (신규 계층형 구조 사용)
-│   └── static/                # index.html, macro.html
+│   └── static/                # chat.html(기본), index.html(/query), macro.html
 └── scripts/                   # 데이터 수집/백필/launchd 진입점
 ```
 
