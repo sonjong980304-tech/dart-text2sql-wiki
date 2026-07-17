@@ -681,17 +681,32 @@ def api_backtest(req: BacktestReq):
 
     if not req.criteria:
         raise HTTPException(400, "지표를 1개 이상 선택하세요.")
+    # UI 지표 목록(metric_def)의 'momentum'(가격모멘텀)은 백테스트 단면에 그 이름의 필드가
+    # 없다(있는 것은 return_12m — 직전 12개월 가격수익률). 도메인 스크리닝 경로(domain_kr.py의
+    # "모멘텀"→return_12m)와 동일 규약으로 여기서 별칭 치환한다. 치환이 없으면 selection.py의
+    # _validate_criteria_keys가 ValueError('존재하지 않는 필드: momentum')를 던져 실행이 실패했다.
+    criteria = [{**c, "key": "return_12m"} if c.get("key") == "momentum" else c
+                for c in req.criteria]
     conn = connect()
     try:
         maxd = conn.execute("SELECT MAX(date) FROM prices").fetchone()[0]
-        dates = [d for d in rebalance_dates(req.start_year, req.end_year, req.rebalance)
-                 if maxd and d <= maxd]
+        full = rebalance_dates(req.start_year, req.end_year, req.rebalance)
+        dates = [d for d in full if maxd and d <= maxd]
+        # 진행 중(미완결) 구간 이어붙이기: 사용자가 요청한 마지막 리밸런싱이 아직 오지 않은
+        # 미래라 잘렸고(예: 반기 전략에서 다음 리밸런싱 2026-07-31이 미도래) 마지막 완결
+        # 리밸런싱 이후에도 가격 데이터가 더 있으면(dates[-1] < maxd), 현재 보유 중인
+        # 포트폴리오의 미완결 구간을 데이터 최신일(maxd)까지 NAV에 이어 붙인다. 이렇게 하지
+        # 않으면 차트가 마지막 완결 리밸런싱(예: 2026-01-31)에서 멈춰 사용자에게는 "왜 최근
+        # 데이터까지 안 보이지?"로 보인다. 종료연도가 과거인 백테스트(잘린 미래 리밸런싱이
+        # 없어 len(dates)==len(full))에는 영향이 없다.
+        if maxd and len(dates) < len(full) and dates and dates[-1] < maxd:
+            dates = dates + [maxd]
         if len(dates) < 2:
             raise HTTPException(400, "선택 기간에 데이터가 부족합니다(주가 시계열 범위 확인).")
         mfn, pfn = build_callbacks(conn)
         bench_fn = build_benchmark_fn(dates, mfn, pfn)
         params = {
-            "n": req.n, "criteria": req.criteria, "combine": req.combine,
+            "n": req.n, "criteria": criteria, "combine": req.combine,
             "sectors": req.sectors, "markets": req.markets, "rebalance": req.rebalance,
             "fee_rate": req.fee_rate if req.fee_rate is not None else CONFIG.fee_rate,
             "tax_rate": req.tax_rate if req.tax_rate is not None else CONFIG.tax_rate,
@@ -704,6 +719,11 @@ def api_backtest(req: BacktestReq):
                     for h in res["holdings"]]
         return {"dates": res["dates"], "navs": res["navs"], "benchmark": res.get("benchmark"),
                 "performance": res["performance"], "holdings": holdings}
+    except ValueError as e:
+        # 존재하지 않는 지표 선택 등 사용자 입력 오류는 500(평문 'Internal Server Error')이 아니라
+        # 400(JSON detail)으로 반환한다. 500 평문 본문은 프런트의 r.json() 파싱을 실패시켜
+        # 브라우저가 'The string did not match the expected pattern.'라는 엉뚱한 에러를 띄웠다.
+        raise HTTPException(400, str(e)) from e
     finally:
         conn.close()
 

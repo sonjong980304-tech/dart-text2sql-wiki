@@ -591,8 +591,12 @@ async function runBacktest(){
   document.getElementById('bt_result').innerHTML='<div class="card"><span class="spinner"></span> 백테스트 중…</div>';
   try{
     const r=await fetch('/api/backtest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const d=await r.json();
-    if(!r.ok) throw new Error(d.detail||'오류');
+    // 응답 본문을 먼저 text로 읽고 방어적으로 JSON 파싱한다. 서버가 비-JSON 에러 본문
+    // (예: 500 'Internal Server Error')을 주면 r.json()이 SyntaxError를 던지는데, 사파리에서는
+    // 그 메시지가 "The string did not match the expected pattern."로 나와 실제 원인을 가렸다.
+    const raw=await r.text();
+    let d={}; try{ d=raw?JSON.parse(raw):{}; }catch(_){ d={detail:raw}; }
+    if(!r.ok) throw new Error(d.detail||`서버 오류 (HTTP ${r.status})`);
     renderBacktest(d);
   }catch(e){document.getElementById('bt_result').innerHTML=`<div class="card err">오류: ${esc(e.message)}</div>`;}
   finally{btn.disabled=false;}
@@ -644,8 +648,27 @@ function navChart(dates,navs,bench){
   const path=navs.map((v,i)=>`${i?'L':'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
   const bpath=hasB?bench.map((v,i)=>`${i?'L':'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' '):'';
   const base=Y(navs[0]);
+  // y축 눈금: NAV를 수익률(%)로 환산해 표시(NAV=1.0을 0%로, (nav-1)*100). 값 범위[min,max]를
+  // 3등분한 지점(최저/중간/최고)에 라벨을 찍는다 — 기존 Y() 좌표변환을 그대로 재사용.
+  const yTicks=[min,(min+max)/2,max].map(v=>({y:Y(v),pct:(v-1)*100}));
+  const yLabels=yTicks.map(t=>
+    `<line x1="${(pad-4).toFixed(1)}" y1="${t.y.toFixed(1)}" x2="${pad}" y2="${t.y.toFixed(1)}" stroke="#2a2f3c"/>`
+    +`<text x="${(pad-6).toFixed(1)}" y="${(t.y+3).toFixed(1)}" fill="#6b7280" font-size="10" text-anchor="end">${t.pct>=0?'+':''}${t.pct.toFixed(1)}%</text>`
+  ).join('');
+  // x축 눈금: 시작·(중간 1~2개)·종료 날짜. 점 개수에 따라 3~4개 인덱스를 골라 기존 X()로 배치.
+  const n=navs.length;
+  const xIdx=n<=3?[...Array(n).keys()]
+    :n<=6?[0,Math.round((n-1)/2),n-1]
+    :[0,Math.round((n-1)/3),Math.round(2*(n-1)/3),n-1];
+  const xLabels=xIdx.map((i,k)=>{
+    const anchor=k===0?'start':(k===xIdx.length-1?'end':'middle');
+    return `<line x1="${X(i).toFixed(1)}" y1="${(h-pad).toFixed(1)}" x2="${X(i).toFixed(1)}" y2="${(h-pad+4).toFixed(1)}" stroke="#2a2f3c"/>`
+      +`<text x="${X(i).toFixed(1)}" y="${(h-pad+16).toFixed(1)}" fill="#6b7280" font-size="10" text-anchor="${anchor}">${esc(dates[i])}</text>`;
+  }).join('');
   return `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:auto;margin-top:8px">
     <line x1="${pad}" y1="${base.toFixed(1)}" x2="${w-pad}" y2="${base.toFixed(1)}" stroke="#2a2f3c" stroke-dasharray="4"/>
+    ${yLabels}
+    ${xLabels}
     ${hasB?`<path d="${bpath}" fill="none" stroke="#8b93a7" stroke-width="1.5" stroke-dasharray="5"/>`:''}
     <path d="${path}" fill="none" stroke="#5b8cff" stroke-width="2"/>
     <text x="${pad}" y="22" fill="#8b93a7" font-size="12">${esc(dates[0])} → ${esc(dates[dates.length-1])}  ·  최종 NAV ${navs[navs.length-1].toFixed(2)} (×${(navs[navs.length-1]/navs[0]).toFixed(2)})</text>
