@@ -369,3 +369,196 @@ def test_resolve_metric_annual_period_none_when_a_quarter_missing(tmp_path):
         conn.close()
 
     assert res["value"] is None
+
+
+# ---------- 즉석 계산 폴백 — 버그: operating_margin 같은 단순 흐름비율이 metrics
+# 사전계산 스냅샷에 없는 과거 분기에서 null로 나온다(실서버 재현: SK하이닉스 24/25년
+# 영업이익률 둘 다 null. 원본 EAV엔 operating_profit/revenue가 정상 존재하는데
+# metrics 테이블엔 최신 한 분기 스냅샷만 있어 과거 분기를 못 덮음). 분자·분모가 모두
+# _SUMMABLE_FLOW_ACCOUNTS인 단순 비율(operating_margin/net_margin/gross_margin/cogs_ratio)은
+# metrics 조회 실패 시 financials EAV 두 계정으로 즉석 계산해야 한다.
+# 우선순위: metrics 테이블에 그 분기 값이 있으면 그걸 최우선, 없을 때만 폴백. ----------
+
+def _seed_eav(conn, code, quarter, account_key, amount):
+    conn.execute(
+        "INSERT INTO financials(stock_code, quarter, disclosed_date, account_key, amount) "
+        "VALUES(?,?,?,?,?)",
+        (code, quarter, "2025-05-15", account_key, amount),
+    )
+
+
+def test_resolve_metric_operating_margin_quarter_falls_back_to_eav(tmp_path):
+    # metrics 행이 없어도 그 분기 operating_profit/revenue(EAV)로 즉석 계산한다.
+    db = str(tmp_path / "om_q.db")
+    init_db(db)
+    conn = connect(db)
+    try:
+        seed_kr_companies(conn, ["000660"])
+        _seed_eav(conn, "000660", "2024Q4", "operating_profit", 8.0e12)
+        _seed_eav(conn, "000660", "2024Q4", "revenue", 20.0e12)
+        conn.commit()
+        res = resolve_metric(
+            conn, "000660", "operating_margin",
+            period={"kind": "quarter", "quarter": "2024Q4"},
+        )
+    finally:
+        conn.close()
+
+    assert res["value"] == 8.0e12 / 20.0e12 * 100.0  # 40.0(%)
+    assert res["source"] == "DART"
+    assert res["period"] == "2024Q4"
+
+
+def test_resolve_metric_operating_margin_annual_uses_summed_ratio(tmp_path):
+    # 연간 비율 = 분자 4분기 합 ÷ 분모 4분기 합(분기별 비율 평균이 아님).
+    db = str(tmp_path / "om_a.db")
+    init_db(db)
+    conn = connect(db)
+    try:
+        seed_kr_companies(conn, ["000660"])
+        for q, op, rev in [
+            ("2024Q1", 1.0e12, 5.0e12), ("2024Q2", 2.0e12, 5.0e12),
+            ("2024Q3", 3.0e12, 5.0e12), ("2024Q4", 4.0e12, 5.0e12),
+        ]:
+            _seed_eav(conn, "000660", q, "operating_profit", op)
+            _seed_eav(conn, "000660", q, "revenue", rev)
+        conn.commit()
+        res = resolve_metric(
+            conn, "000660", "operating_margin",
+            period={"kind": "annual", "year": 2024},
+        )
+    finally:
+        conn.close()
+
+    assert res["value"] == (1.0e12 + 2.0e12 + 3.0e12 + 4.0e12) / (5.0e12 * 4) * 100.0  # 50.0
+    assert res["source"] == "DART"
+    assert "2024" in str(res["period"]) and "연간" in str(res["period"])
+
+
+def test_resolve_metric_operating_margin_annual_none_when_quarter_missing(tmp_path):
+    # SoT(추정 금지): 4개 분기 중 하나라도 없으면 연간 비율을 계산하지 않는다.
+    db = str(tmp_path / "om_partial.db")
+    init_db(db)
+    conn = connect(db)
+    try:
+        seed_kr_companies(conn, ["000660"])
+        for q in ("2024Q1", "2024Q2", "2024Q3"):  # 2024Q4 누락
+            _seed_eav(conn, "000660", q, "operating_profit", 2.0e12)
+            _seed_eav(conn, "000660", q, "revenue", 5.0e12)
+        conn.commit()
+        res = resolve_metric(
+            conn, "000660", "operating_margin",
+            period={"kind": "annual", "year": 2024},
+        )
+    finally:
+        conn.close()
+
+    assert res["value"] is None
+
+
+def test_resolve_metric_operating_margin_quarter_none_when_denominator_missing(tmp_path):
+    # 분모(매출)가 없으면 0/None 나눗셈 금지 → None.
+    db = str(tmp_path / "om_norev.db")
+    init_db(db)
+    conn = connect(db)
+    try:
+        seed_kr_companies(conn, ["000660"])
+        _seed_eav(conn, "000660", "2024Q4", "operating_profit", 8.0e12)  # revenue 없음
+        conn.commit()
+        res = resolve_metric(
+            conn, "000660", "operating_margin",
+            period={"kind": "quarter", "quarter": "2024Q4"},
+        )
+    finally:
+        conn.close()
+
+    assert res["value"] is None
+
+
+def test_resolve_metric_operating_margin_prefers_metrics_row_over_eav_fallback(tmp_path):
+    # metrics 테이블에 그 분기 값이 있으면 즉석계산이 덮어쓰면 안 된다(사전계산값 최우선).
+    db = str(tmp_path / "om_pref.db")
+    init_db(db)
+    conn = connect(db)
+    try:
+        seed_kr_companies(conn, ["000660"])
+        _seed_eav(conn, "000660", "2026Q1", "operating_profit", 8.0e12)  # EAV로는 40%
+        _seed_eav(conn, "000660", "2026Q1", "revenue", 20.0e12)
+        conn.execute(  # metrics 사전계산값 33.3 — 이게 우선돼야 한다
+            "INSERT INTO metrics(stock_code, quarter, price_date, operating_margin) VALUES(?,?,?,?)",
+            ("000660", "2026Q1", "2026-04-01", 33.3),
+        )
+        conn.commit()
+        res = resolve_metric(
+            conn, "000660", "operating_margin",
+            period={"kind": "quarter", "quarter": "2026Q1"},
+        )
+    finally:
+        conn.close()
+
+    assert res["value"] == 33.3  # 즉석계산 40%가 아니라 metrics 사전계산값
+
+
+def test_resolve_metric_operating_margin_no_period_uses_metrics_snapshot(tmp_path):
+    # 회귀: 기간 미지정이면 기존처럼 metrics 최신 스냅샷을 쓴다(폴백은 과거 분기 조회 전용).
+    db = str(tmp_path / "om_none.db")
+    init_db(db)
+    conn = connect(db)
+    try:
+        seed_kr_companies(conn, ["000660"])
+        conn.execute(
+            "INSERT INTO metrics(stock_code, quarter, price_date, operating_margin) VALUES(?,?,?,?)",
+            ("000660", "2026Q1", "2026-04-01", 27.5),
+        )
+        conn.commit()
+        res = resolve_metric(conn, "000660", "operating_margin")
+    finally:
+        conn.close()
+
+    assert res["value"] == 27.5
+    assert res["period"] == "2026Q1"
+
+
+def test_resolve_metric_per_not_affected_by_flow_ratio_fallback(tmp_path):
+    # 회귀: PER은 이번 폴백 대상이 아니다 — metrics 행이 없으면 EAV가 있어도 여전히 None.
+    db = str(tmp_path / "per.db")
+    init_db(db)
+    conn = connect(db)
+    try:
+        seed_kr_companies(conn, ["000660"])
+        _seed_eav(conn, "000660", "2024Q4", "operating_profit", 8.0e12)
+        _seed_eav(conn, "000660", "2024Q4", "revenue", 20.0e12)
+        conn.commit()
+        res = resolve_metric(
+            conn, "000660", "per",
+            period={"kind": "quarter", "quarter": "2024Q4"},
+        )
+    finally:
+        conn.close()
+
+    assert res["value"] is None
+
+
+def test_resolve_metric_net_gross_cogs_ratios_fall_back_to_eav(tmp_path):
+    # net_margin/gross_margin/cogs_ratio도 동일하게 EAV 두 계정으로 즉석 계산한다.
+    db = str(tmp_path / "ratios.db")
+    init_db(db)
+    conn = connect(db)
+    try:
+        seed_kr_companies(conn, ["000660"])
+        _seed_eav(conn, "000660", "2024Q4", "revenue", 100.0)
+        _seed_eav(conn, "000660", "2024Q4", "net_income", 12.0)
+        _seed_eav(conn, "000660", "2024Q4", "gross_profit", 30.0)
+        _seed_eav(conn, "000660", "2024Q4", "cost_of_sales", 70.0)
+        conn.commit()
+        q = {"kind": "quarter", "quarter": "2024Q4"}
+        nm = resolve_metric(conn, "000660", "net_margin", period=q)
+        gm = resolve_metric(conn, "000660", "gross_margin", period=q)
+        cr = resolve_metric(conn, "000660", "cogs_ratio", period=q)
+    finally:
+        conn.close()
+
+    assert nm["value"] == 12.0 / 100.0 * 100.0
+    assert gm["value"] == 30.0 / 100.0 * 100.0
+    assert cr["value"] == 70.0 / 100.0 * 100.0
+    assert nm["source"] == gm["source"] == cr["source"] == "DART"

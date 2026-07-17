@@ -85,6 +85,22 @@ _SUMMABLE_FLOW_ACCOUNTS: frozenset[str] = frozenset({
     "net_income", "interest_expense", "operating_cashflow", "depreciation", "dividend",
 })
 
+# 원본 EAV 흐름값 계정 두 개(분자, 분모)만으로 즉석 계산 가능한 단순 비율 지표(%).
+# metrics 사전계산 테이블은 "가장 최근 인제스트 시점의 스냅샷 한 분기"만 유지하므로,
+# 과거 분기를 지목한 질문(예: SK하이닉스 24/25년 영업이익률)은 그 분기 metrics 행이 없어
+# null로 빠진다 — 원본 financials(EAV)엔 두 계정이 정상 존재하는데도. 그 경우 여기 등록된
+# 지표만 EAV 두 계정을 직접 읽어 비율을 즉석 계산한다(metrics.py/_div와 동일하게 ×100 퍼센트).
+# 분자·분모가 모두 _SUMMABLE_FLOW_ACCOUNTS 소속이라 분기값은 그 분기 두 계정을, 연간값은
+# 각 계정의 4분기 합을 나눈다(분기별 비율의 평균이 아니라 연간 합계 기준 비율 — 재무 관례).
+# per/pbr/시총(주가 필요)·roe(평균자본)·debt_ratio(잔액) 등은 EAV 두 흐름계정만으로
+# 재현 불가라 제외한다.
+_FLOW_RATIO_ACCOUNTS: dict[str, tuple[str, str]] = {
+    "operating_margin": ("operating_profit", "revenue"),
+    "net_margin": ("net_income", "revenue"),
+    "gross_margin": ("gross_profit", "revenue"),
+    "cogs_ratio": ("cost_of_sales", "revenue"),
+}
+
 
 def _normalize_source(value: str | None) -> str:
     """소스 문자열(대소문자/여백 섞임)을 표준 'DART'|'FnGuide'로 정규화."""
@@ -136,6 +152,65 @@ def _fetch_dart_at_quarter(
     return None
 
 
+def _fetch_eav_amount(
+    conn: sqlite3.Connection, key: str, stock_code: str, quarter: str
+) -> float | None:
+    """financials(EAV)에서 (stock_code, account_key, quarter)의 금액. 없으면 None."""
+    row = conn.execute(
+        "SELECT amount FROM financials WHERE stock_code=? AND account_key=? AND quarter=?",
+        (stock_code, key, quarter),
+    ).fetchone()
+    return row["amount"] if row is not None else None
+
+
+def _sum_four_quarters(
+    conn: sqlite3.Connection, key: str, stock_code: str, year: int
+) -> float | None:
+    """year의 4개 분기(Q1~Q4) EAV 금액 합. 4개 모두 있을 때만 합, 하나라도 없으면 None.
+
+    SoT(누락 분기 추정 금지): 4개 분기가 모두 존재할 때만 연간 합계를 낸다. 흐름값 계정의
+    연간 합산(_fetch_dart annual)과 흐름비율의 연간 분자·분모 합산이 이 규칙을 공유한다.
+    """
+    quarters = [f"{year}Q{i}" for i in (1, 2, 3, 4)]
+    placeholders = ",".join("?" for _ in quarters)
+    rows = conn.execute(
+        f"SELECT quarter, amount FROM financials WHERE stock_code=? AND account_key=? "
+        f"AND quarter IN ({placeholders})",
+        (stock_code, key, *quarters),
+    ).fetchall()
+    amounts = {r["quarter"]: r["amount"] for r in rows if r["amount"] is not None}
+    return sum(amounts.values()) if len(amounts) == 4 else None
+
+
+def _fetch_flow_ratio(
+    conn: sqlite3.Connection, key: str, stock_code: str, period: dict
+) -> tuple[float, str, str | None] | None:
+    """단순 흐름비율 지표(_FLOW_RATIO_ACCOUNTS)를 원본 EAV 두 계정으로 즉석 계산(%).
+
+    metrics 사전계산 스냅샷에 그 분기 값이 없을 때만 부르는 폴백(호출부가 우선순위 보장).
+    분모가 0/None이거나 분자가 None이면 계산하지 않는다(SoT: 억지 추정 금지). 반환 형식은
+    _fetch_dart_at_quarter와 동일한 (value, 기간라벨, price_date=None) — 순수 재무비율이라
+    price_date는 항상 None이고, source는 호출부에서 여전히 'DART'로 채워진다(즉석 계산이라는
+    사실을 별도로 노출하지 않는다).
+    - quarter: 그 분기의 분자/분모 EAV를 나눈다.
+    - annual: 분자 4분기 합 ÷ 분모 4분기 합(각 4개 모두 있을 때만, 없으면 None).
+    """
+    num_key, den_key = _FLOW_RATIO_ACCOUNTS[key]
+    if period.get("kind") == "annual":
+        year = period["year"]
+        num = _sum_four_quarters(conn, num_key, stock_code, year)
+        den = _sum_four_quarters(conn, den_key, stock_code, year)
+        label = f"{year} 연간"
+    else:  # quarter
+        quarter = period["quarter"]
+        num = _fetch_eav_amount(conn, num_key, stock_code, quarter)
+        den = _fetch_eav_amount(conn, den_key, stock_code, quarter)
+        label = quarter
+    if num is None or not den:  # 분자 None 또는 분모 0/None → 계산 불가
+        return None
+    return num / den * 100.0, label, None
+
+
 def _fetch_dart(
     conn: sqlite3.Connection,
     stock_code: str,
@@ -179,23 +254,23 @@ def _fetch_dart(
         return None
 
     if period.get("kind") == "quarter":
-        return _fetch_dart_at_quarter(conn, key, stock_code, period["quarter"])
+        result = _fetch_dart_at_quarter(conn, key, stock_code, period["quarter"])
+        # metrics 스냅샷에 없는 과거 분기라도 단순 흐름비율은 원본 EAV 두 계정으로 즉석
+        # 계산한다(폴백). metrics 값이 있으면 위에서 이미 반환되므로 사전계산값이 최우선.
+        if result is None and key in _FLOW_RATIO_ACCOUNTS:
+            return _fetch_flow_ratio(conn, key, stock_code, period)
+        return result
 
     # kind == "annual"
     year = period["year"]
     if key in _SUMMABLE_FLOW_ACCOUNTS:
-        quarters = [f"{year}Q{i}" for i in (1, 2, 3, 4)]
-        placeholders = ",".join("?" for _ in quarters)
-        rows = conn.execute(
-            f"SELECT quarter, amount FROM financials WHERE stock_code=? AND account_key=? "
-            f"AND quarter IN ({placeholders})",
-            (stock_code, key, *quarters),
-        ).fetchall()
-        amounts = {r["quarter"]: r["amount"] for r in rows if r["amount"] is not None}
-        if len(amounts) == 4:  # 4개 분기 모두 있을 때만 합산(추정 금지)
-            return sum(amounts.values()), f"{year} 연간", None
-        return None
-    # 흐름값이 아닌 계정(잔액/비율)은 연말(Q4) 스냅샷.
+        total = _sum_four_quarters(conn, key, stock_code, year)
+        return (total, f"{year} 연간", None) if total is not None else None
+    # 단순 흐름비율은 연말(Q4) 스냅샷이 아니라 분자 4분기 합 ÷ 분모 4분기 합으로 계산한다
+    # (Q4 단일분기 마진을 연간 마진으로 오인하지 않게 — 재무 관례상 연간 합계 기준 비율).
+    if key in _FLOW_RATIO_ACCOUNTS:
+        return _fetch_flow_ratio(conn, key, stock_code, period)
+    # 그 외 흐름값이 아닌 계정(잔액/주가비율)은 연말(Q4) 스냅샷.
     return _fetch_dart_at_quarter(conn, key, stock_code, f"{year}Q4")
 
 
