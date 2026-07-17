@@ -545,6 +545,55 @@ def test_answer_us_question_retries_and_recovers_on_second_attempt(tmp_path):
     assert len(calls) == 2
 
 
+# ── 빈 데이터를 성공으로 오보고하지 않는지(회귀) ──────────────────────────────
+# 외부 리뷰 지적: 재무/주가 데이터 에이전트가 예외 없이 "데이터 없음"(None/빈 리스트)을
+# 돌려주면 _is_failure_result가 실패로 못 잡아(dict+ok=False 형태만 체크) 도메인 에이전트가
+# ok=True로 오보고했다. exec_fallback._is_meaningfully_empty(이미 검증된 빈결과 판별 패턴)를
+# 재사용해 None/[]/{} 도 실패로 취급하도록 고친다.
+def test_answer_us_question_reports_failure_when_financial_data_is_empty(tmp_path):
+    """financial_fn이 예외 없이 None(데이터 없음)을 돌려주면 ok=True로 오보고하면 안 된다."""
+    db = _seed_us_db(tmp_path)
+    conn = connect_readonly(db)
+    calls = []
+
+    def empty_financial_fn(conn, code, **kwargs):
+        calls.append(code)
+        return None
+
+    try:
+        result = answer_us_question(
+            "AAPL PER 알려줘", conn, financial_fn=empty_financial_fn,
+        )
+    finally:
+        conn.close()
+    assert result["ok"] is False
+    assert result["financial"] is None
+    assert result["error"]
+    assert len(calls) == 2  # 최초 1회 + 재시도 1회(빈 결과도 재시도 대상)
+
+
+def test_answer_us_question_reports_failure_when_price_data_is_empty(tmp_path):
+    """price_fn이 예외 없이 빈 리스트(데이터 없음)를 돌려주면 ok=True로 오보고하면 안 된다."""
+    db = _seed_us_db(tmp_path)
+    conn = connect_readonly(db)
+    calls = []
+
+    def empty_price_fn(conn, code, **kwargs):
+        calls.append(code)
+        return []
+
+    try:
+        result = answer_us_question(
+            "AAPL 주가 알려줘", conn, price_fn=empty_price_fn,
+        )
+    finally:
+        conn.close()
+    assert result["ok"] is False
+    assert result["price"] is None
+    assert result["error"]
+    assert len(calls) == 2
+
+
 # ── security_type 필터 (증권종류 — 워런트/ADR 등 제외, HA15 후속(B)) ──────────────────
 # 배경: 실서버 curl 재현 — 나스닥 저PER 스크리닝 상위권에 SKHYV(ADR)/RNWWW·BNCWW(Warrant)
 # 같은 파생·특수 증권이 섞여 나왔다. us_company.name에 이미 "…Warrant"/"…American

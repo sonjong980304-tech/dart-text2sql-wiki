@@ -42,6 +42,7 @@ from src.agents.domain_kr import (
     _wants_price_history,
     is_screening_question,
 )
+from src.agents.exec_fallback import _is_meaningfully_empty
 from src.agents.exec_runtime import execute_sql
 from src.backtest.data_access_us import METRIC_FIELD_DESCRIPTIONS_US, metrics_at_us
 from src.backtest.primitives import combine, get_cross_section
@@ -272,16 +273,26 @@ def get_financials_us(
 
 
 def _is_failure_result(result) -> bool:
-    return isinstance(result, dict) and result.get("ok") is False
+    """result가 실패인지 판단한다: (1) {"ok": False, ...}(execute_sql 계약) 또는
+    (2) None/[]/{}처럼 "속이 빈" 데이터-없음 결과(exec_fallback._is_meaningfully_empty
+    재사용 — 이미 검증된 빈결과 판별 패턴, 새로 만들지 않는다).
+
+    (2)가 없으면 재무/주가 데이터 에이전트가 예외 없이 None이나 빈 리스트를 돌려줄 때
+    (예: 티커는 해석됐지만 해당 시점 유효 데이터가 없는 경우) 실패로 못 잡아
+    answer_us_question이 "ok": True로 오보고했다(실서버 재현 버그).
+    """
+    if isinstance(result, dict) and result.get("ok") is False:
+        return True
+    return _is_meaningfully_empty(result)
 
 
 def _call_with_retry(fn: Callable, *args, retries: int = 1, **kwargs) -> dict:
     """데이터 에이전트 호출을 최대 retries회(기본 1회) 재시도한다(HA-6과 동일 원칙).
 
-    fn(*args, **kwargs) 호출이 예외를 던지거나 {"ok": False, ...} 형태(execute_sql
-    계약)를 반환하면 실패로 간주해 즉시 재시도하고, 그래도 계속 실패하면 예외를
-    전파하지 않고 실패 사유를 담아 반환한다 — 도메인 에이전트(가까운 계층)에서
-    흡수하므로 총괄 에이전트까지 예외가 뚫고 올라가지 않는다.
+    fn(*args, **kwargs) 호출이 예외를 던지거나 {"ok": False, ...} 형태(execute_sql 계약)를
+    반환하거나, 예외 없이 None/[]/{}(데이터 없음)를 반환하면 실패로 간주해 즉시 재시도하고,
+    그래도 계속 실패하면 예외를 전파하지 않고 실패 사유를 담아 반환한다 — 도메인
+    에이전트(가까운 계층)에서 흡수하므로 총괄 에이전트까지 예외가 뚫고 올라가지 않는다.
 
     반환: {"ok": True, "result": ..., "error": None} 또는
           {"ok": False, "result": None, "error": str}.
@@ -294,7 +305,10 @@ def _call_with_retry(fn: Callable, *args, retries: int = 1, **kwargs) -> dict:
             last_error = f"{type(exc).__name__}: {exc}"
             continue
         if _is_failure_result(result):
-            last_error = result.get("error") or "data agent returned ok=False"
+            if isinstance(result, dict):
+                last_error = result.get("error") or "data agent returned ok=False"
+            else:
+                last_error = "data agent returned empty result"
             continue
         return {"ok": True, "result": result, "error": None}
     return {"ok": False, "result": None, "error": last_error}
