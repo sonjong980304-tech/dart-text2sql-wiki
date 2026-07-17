@@ -476,6 +476,14 @@ def _domain_has_data(result: dict) -> bool:
         isinstance(e, dict) and (e.get("financial") or e.get("price")) for e in entities
     ):
         return True
+    # kr 다중분기(multi-period, domain_kr): 한 종목의 여러 분기를 조회하면 최상위 financial은
+    # None이고 실제 데이터는 periods 리스트에 기간별로 담긴다(entities와 동일 관례). 하나라도
+    # financial이 있으면 데이터 있음으로 본다.
+    periods = result.get("periods")
+    if isinstance(periods, list) and any(
+        isinstance(p, dict) and p.get("financial") for p in periods
+    ):
+        return True
     # macro: available=True.
     if result.get("available"):
         return True

@@ -58,6 +58,12 @@ def _stock_code_candidates(text: str) -> list[str]:
 _METRIC_KO_ALIASES: dict[str, str] = {
     "매출액": "revenue",
     "매출": "revenue",
+    # "영업이익률"(비율)은 반드시 "영업이익"(원본 계정 금액)보다 먼저 와야 한다 — _extract_metric이
+    # 이 딕셔너리를 삽입 순서대로 순회하며 첫 부분일치를 채택하므로, 더 긴 "영업이익률"을 앞에 두지
+    # 않으면 부분문자열 "영업이익"이 먼저 매치돼 operating_profit으로 오매핑된다(실서버 재현 버그).
+    # operating_margin은 metrics 테이블에 사전계산돼 resolve_metric으로 조회 가능하다(computed-only
+    # 가 아니라 _COMPUTED_KO_ALIASES 경로로는 안 잡혀 여기서 별칭을 명시해야 인식된다).
+    "영업이익률": "operating_margin",
     "영업이익": "operating_profit",
     "당기순이익": "net_income",
     "순이익": "net_income",
@@ -1001,6 +1007,98 @@ def _parse_period(question: str) -> dict | None:
     return {"kind": "annual", "year": year}
 
 
+def _parse_periods(question: str) -> list[dict]:
+    """질문에서 여러 조회 기간을 순서대로 파싱한다(다중분기 지원). _parse_period의 리스트판.
+
+    _parse_period는 첫 연도/첫 분기 하나만 잡아 "하이닉스 25년과 26년 1분기 영업이익률"의
+    둘째 분기(2026Q1)를 통째로 버렸다. 이 함수는 언급된 각 기간을 위치 순서대로 담아 반환한다.
+    원소 형식은 _parse_period와 동일하다({"kind":"quarter","quarter":"YYYYQn"} 또는
+    {"kind":"annual","year":YYYY}).
+
+    파싱 규칙(연도와 분기가 어떻게 짝지어지는지):
+    - 연도 토큰(4자리/2자리+년)마다 새 "기간 슬롯"을 연다. 분기 토큰은 바로 앞의 아직 분기가
+      비어 있는 슬롯을 채우고, 이미 찬 슬롯 뒤에 오면 같은 연도로 새 슬롯을 연다
+      (예: "2025년 1분기와 2분기" → 2025Q1, 2025Q2 — 한 연도가 두 분기를 가짐).
+    - 각 연도가 자기 분기를 하나씩 명시하면 그대로 짝짓는다
+      (예: "2025년 1분기와 2026년 1분기" → 2025Q1, 2026Q1).
+    - "공유 분기" 규칙: 분기가 딱 하나만 명시됐는데 분기 없는(bare) 연도 슬롯이 남아 있으면,
+      그 단일 분기를 bare 연도들에도 적용한다. "25년과 26년 1분기"에서 앞의 "25년"은 뒤의
+      "1분기"를 공유해 2025Q1이 되는 것이 한국어의 자연스러운 비교 표현이기 때문이다
+      (이 경우 → 2025Q1, 2026Q1). 분기가 2개 이상 서로 다르게 명시되면 공유하지 않고 bare
+      연도는 그 해 연간(사업보고서)으로 남긴다(혼재 질문의 합리적 해석).
+    - 연도가 하나도 없으면(분기 단독 포함) 빈 리스트를 반환한다 — _parse_period가 None을
+      돌려 "현행 최신분기 유지"로 흐르던 것과 같은 회귀-안전 동작이다.
+
+    호출부는 _strip_retry_feedback을 거친 원본 질문을 넘긴다(_parse_period와 동일 원칙).
+    """
+    q = question or ""
+
+    # 연도 토큰 수집(4자리/2자리+년). 두 정규식은 lookbehind로 서로 겹치지 않는다
+    # (2자리 연도는 앞에 숫자가 붙으면 매치 안 되므로 "2025" 안의 "25"는 잡히지 않음).
+    year_events: list[tuple[int, int]] = []  # (position, year)
+    for m in _YEAR_FULL_RE.finditer(q):
+        year_events.append((m.start(), int(m.group(1))))
+    for m in _YEAR_SHORT_RE.finditer(q):
+        year_events.append((m.start(), 2000 + int(m.group(1))))
+
+    # 분기 토큰 수집(한글 "N분기" / "qN"). 같은 위치를 두 형식이 동시에 잡는 일은 없다.
+    quarter_events: list[tuple[int, int]] = []  # (position, quarter_n)
+    for m in _QUARTER_KO_RE.finditer(q):
+        quarter_events.append((m.start(), int(m.group(1))))
+    for m in _QUARTER_Q_RE.finditer(q):
+        quarter_events.append((m.start(), int(m.group(1))))
+
+    if not year_events:
+        return []  # 연도 없으면 기간 미지정(분기 단독은 현행 유지)
+
+    # 연도/분기 이벤트를 위치 순서로 병합해 슬롯을 만든다.
+    events = [(pos, "year", val) for pos, val in year_events] + \
+             [(pos, "quarter", val) for pos, val in quarter_events]
+    events.sort(key=lambda e: e[0])
+
+    slots: list[dict] = []  # 각 원소 {"year": int, "quarter": int | None}
+    current_year: int | None = None
+    orphan_quarters: list[int] = []  # 아직 연도가 안 나온 시점에 등장한 분기(예: "1분기 2025년")
+    for _pos, kind, val in events:
+        if kind == "year":
+            current_year = val
+            slots.append({"year": val, "quarter": None})
+        else:  # quarter
+            if slots and slots[-1]["quarter"] is None:
+                slots[-1]["quarter"] = val
+            elif current_year is not None:
+                slots.append({"year": current_year, "quarter": val})
+            else:
+                # 연도가 아직 없는데 분기가 먼저 왔다(부자연스러운 "1분기 2025년" 순서).
+                # 버리지 않고 모아 뒤의 bare 연도에 공유 분기로 붙인다 — _parse_period가
+                # 순서 무관하게 첫 연도+첫 분기를 짝짓는 것과 동작을 일치시킨다(회귀-안전).
+                orphan_quarters.append(val)
+
+    # 공유 분기 백필: bare 연도 슬롯이 남았고 명시된 분기(고아 포함)가 정확히 하나면 공유한다.
+    distinct_quarters = {s["quarter"] for s in slots if s["quarter"] is not None}
+    distinct_quarters |= set(orphan_quarters)
+    has_bare = any(s["quarter"] is None for s in slots)
+    if has_bare and len(distinct_quarters) == 1:
+        shared = next(iter(distinct_quarters))
+        for s in slots:
+            if s["quarter"] is None:
+                s["quarter"] = shared
+
+    periods: list[dict] = []
+    for s in slots:
+        if s["quarter"] is not None:
+            periods.append({"kind": "quarter", "quarter": f"{s['year']}Q{s['quarter']}"})
+        else:
+            periods.append({"kind": "annual", "year": s["year"]})
+
+    # 동일 기간이 중복 언급돼도 한 번만(순서 보존) — 불필요한 중복 조회 방지.
+    deduped: list[dict] = []
+    for p in periods:
+        if p not in deduped:
+            deduped.append(p)
+    return deduped
+
+
 # ── "최근 N개월/N년 수익률" 기간 수익률 파서 (실서버 재현 버그 수정) ─────────────────
 # "삼성전자 최근 3개월 수익률"처럼 12가 아닌 임의 개월수는 _extract_metric(리터럴 "12개월"
 # 별칭만 인식)이 못 잡아 free_exec LLM 코드생성으로 폴백 → LLM이 8년 전 데이터로 계산해
@@ -1345,6 +1443,37 @@ def _answer_kr_multi_entity_question(
     }
 
 
+def _resolve_metric_over_periods(
+    resolve_metric_fn: Callable,
+    conn,
+    stock_code: str,
+    metric: str,
+    periods: list[dict],
+    llm_fn: Callable[[str], str] | None,
+) -> list[dict]:
+    """여러 기간(분기/연간) 각각에 resolve_metric_fn을 호출해 기간별 결과 리스트로 담는다.
+
+    반환 원소: {"period": <라벨>, "financial": <resolve_metric 결과 or None>, "errors": [...]}.
+    라벨은 파싱된 기간(quarter="2026Q1" 또는 annual→"YYYY 연간")이라 프런트/검증이 어떤
+    분기의 값인지 명확히 구분할 수 있다. 다중종목 경로의 entities 리스트와 동일한
+    '리스트-of-딕셔너리' 관례를 따른다. 여기 오는 period는 항상 명시적이므로 period 인자를
+    그대로 넘긴다(단일/무기간 경로는 호출부에서 이미 분기해 이 함수를 타지 않는다).
+    """
+    out: list[dict] = []
+    for p in periods:
+        label = p["quarter"] if p["kind"] == "quarter" else f"{p['year']} 연간"
+        entry: dict = {"period": label, "financial": None, "errors": []}
+        financial, err = _call_with_retry(
+            lambda p=p: resolve_metric_fn(conn, stock_code, metric, llm_fn=llm_fn, period=p)
+        )
+        if err:
+            entry["errors"].append(f"재무데이터 조회 실패: {err}")
+        else:
+            entry["financial"] = financial
+        out.append(entry)
+    return out
+
+
 def answer_kr_question(
     question: str,
     conn,
@@ -1379,6 +1508,10 @@ def answer_kr_question(
             "price": list[dict] | None,   # get_price_snapshot_kr() 결과
             "errors": list[str],
         }
+    질문이 서로 다른 분기/연도를 2개 이상 지목하면(예: "25년과 26년 1분기") financial 대신
+    "periods": [{"period": "2025Q1", "financial": {...}, "errors": []}, ...] 를 담는다
+    (기간별로 명확히 구분; 다중종목 entities와 동일한 리스트 관례). 단일/무기간 질문은 기존
+    그대로 financial 하나만 담고 periods 키는 없다(회귀 없음).
     """
     resolve_metric_fn = resolve_metric_fn or resolve_metric
     price_snapshot_fn = price_snapshot_fn or get_price_snapshot_kr
@@ -1390,6 +1523,9 @@ def answer_kr_question(
     # 기간/차트 의도는 재시도 피드백이 아니라 원본 질문 기준으로 판단한다(wants_chart 원칙).
     base_question = _strip_retry_feedback(question)
     period = _parse_period(base_question)
+    # 다중분기("25년과 26년 1분기")를 위한 기간 리스트. 0/1개면 기존 단일 period 경로가
+    # 그대로 동작하고(회귀 없음), 2개 이상일 때만 아래 재무 조회에서 분기별로 순회한다.
+    periods = _parse_periods(base_question)
 
     # 스크리닝(다중종목 랭킹) 질문은 단일종목 조회 경로 대신 스크리닝 경로로 분기한다(HA-15).
     # is_screening_question 도 LLM 우선 판단이므로 llm_fn 을 관통시킨다(키워드 목록에 없는
@@ -1464,6 +1600,12 @@ def answer_kr_question(
                 result["errors"].append(f"계산 지표 조회 실패: {err}")
             else:
                 result["financial"] = financial
+        elif len(periods) >= 2:
+            # 다중분기("25년과 26년 1분기"): 각 분기를 개별 조회해 기간별로 구분해 담는다.
+            # 최상위 financial은 None으로 두고(다중종목 entities와 동일 관례) periods에 담는다.
+            result["periods"] = _resolve_metric_over_periods(
+                resolve_metric_fn, conn, stock_code, metric, periods, llm_fn
+            )
         else:
             # 기간이 파싱된 경우에만 period 인자를 넘긴다 — 미지정이면 기존 fake/시그니처
             # (conn, stock_code, metric, llm_fn)을 그대로 존중해 회귀를 막는다.

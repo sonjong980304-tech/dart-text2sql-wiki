@@ -13,7 +13,9 @@ from __future__ import annotations
 import pytest
 
 from src.agents.domain_kr import (
+    _extract_metric,
     _parse_period,
+    _parse_periods,
     _parse_recent_return_months,
     _strip_retry_feedback,
     answer_kr_question,
@@ -704,6 +706,100 @@ def test_strip_retry_feedback_noop_when_no_feedback():
     assert _strip_retry_feedback("삼성전자 영업이익") == "삼성전자 영업이익"
 
 
+# ── 다중분기 파싱(_parse_periods) — 한 질문에 여러 분기/연도가 함께 언급된 경우 ──────────
+# 실서버 재현 버그: "하이닉스 25년과 26년 1분기 영업이익률"처럼 한 질문이 여러 분기를 지목하면
+# _parse_period(단일 dict만 반환)가 첫 분기(2025Q1)만 잡고 둘째("26년 1분기")를 통째로 버렸다.
+# _parse_periods는 언급된 각 기간을 위치 순서대로 리스트로 반환한다.
+
+def test_parse_periods_shared_quarter_across_two_years():
+    # "25년과 26년 1분기": 뒤에 붙은 단일 분기(1분기)를 두 연도가 공유 → 각 연도의 1분기 비교.
+    # (분기가 여럿 명시되면 각자 자기 분기를 쓰고, 단 하나만 명시되면 앞의 맨연도가 그 분기를
+    #  공유하는 게 한국어의 자연스러운 비교 표현이다.)
+    assert _parse_periods("하이닉스 25년과 26년 1분기 영업이익률") == [
+        {"kind": "quarter", "quarter": "2025Q1"},
+        {"kind": "quarter", "quarter": "2026Q1"},
+    ]
+
+
+def test_parse_periods_each_year_has_own_quarter():
+    assert _parse_periods("삼성전자 2025년 1분기와 2026년 1분기 매출") == [
+        {"kind": "quarter", "quarter": "2025Q1"},
+        {"kind": "quarter", "quarter": "2026Q1"},
+    ]
+
+
+def test_parse_periods_two_quarters_share_one_year():
+    assert _parse_periods("삼성전자 2025년 1분기와 2분기 영업이익") == [
+        {"kind": "quarter", "quarter": "2025Q1"},
+        {"kind": "quarter", "quarter": "2025Q2"},
+    ]
+
+
+def test_parse_periods_single_quarter_matches_parse_period():
+    # 단일 기간은 _parse_period와 동일한 원소 하나만 담는다(회귀 없음).
+    assert _parse_periods("삼성전자 26년 1분기 영업이익") == [
+        {"kind": "quarter", "quarter": "2026Q1"},
+    ]
+
+
+def test_parse_periods_single_annual_matches_parse_period():
+    assert _parse_periods("삼성전자 2025년 영업이익") == [
+        {"kind": "annual", "year": 2025},
+    ]
+
+
+def test_parse_periods_two_bare_years_are_annual_each():
+    # 분기가 전혀 없으면 각 연도를 그 해 연간으로 본다.
+    assert _parse_periods("삼성전자 2024년과 2025년 매출") == [
+        {"kind": "annual", "year": 2024},
+        {"kind": "annual", "year": 2025},
+    ]
+
+
+def test_parse_periods_empty_when_no_year():
+    # 연도가 없으면(분기 단독 포함) 빈 리스트 — 기존 최신분기 유지 경로로 흐른다.
+    assert _parse_periods("삼성전자 PER 알려줘") == []
+    assert _parse_periods("삼성전자 1분기 영업이익") == []
+
+
+# ── 지표 파싱(_extract_metric) — 회귀: "영업이익률"(비율)이 "영업이익"(금액)으로 오매핑 ─────
+# 실서버 재현 버그: "하이닉스 …영업이익률" 질문에서 _extract_metric이 부분문자열 "영업이익"을
+# 먼저 매치해 operating_profit(원본 계정 금액)을 뽑았다. operating_margin은 METRIC_SOURCE_MAP에
+# 있어 computed-only 별칭 경로(_COMPUTED_KO_ALIASES)에 안 들어가고, _METRIC_KO_ALIASES에도
+# "영업이익률" 키가 없어 발생. (net_margin은 우연히 computed-only라 "순이익률"이 먼저 잡혀 정상.)
+
+def test_extract_metric_operating_margin_ratio_not_raw_profit():
+    # 비율 지표 "영업이익률"은 operating_margin이어야 한다(원본 계정 operating_profit이 아님).
+    assert _extract_metric("삼성전자 영업이익률") == "operating_margin"
+    assert _extract_metric("하이닉스 25년과 26년 1분기 영업이익률") == "operating_margin"
+    # 회귀: "영업이익"(률 없음, 원본 계정)은 여전히 operating_profit으로 남아야 한다.
+    assert _extract_metric("삼성전자 영업이익") == "operating_profit"
+    # 회귀: "순이익률"은 computed 경로로 net_margin(기존 정상 동작 유지).
+    assert _extract_metric("삼성전자 순이익률") == "net_margin"
+
+
+def test_answer_kr_question_operating_margin_routes_ratio_metric(tmp_path):
+    # end-to-end: "영업이익률" 질문이 resolve_metric_fn에 operating_margin으로 전달돼야 한다
+    # (operating_profit 금액이 아니라). 실서버에서 kr 도메인 경로가 영업이익 '금액'만 답하던 원인.
+    db = _seed(tmp_path)
+    seen: dict = {}
+
+    def spy_resolve_metric(conn, stock_code, metric, llm_fn=None, period=None):
+        seen["metric"] = metric
+        return {"stock_code": stock_code, "metric": metric,
+                "value": 21.09, "source": "DART", "period": "2025Q1"}
+
+    conn = connect_readonly(db)
+    try:
+        answer_kr_question(
+            "삼성전자 25년 1분기 영업이익률", conn, resolve_metric_fn=spy_resolve_metric
+        )
+    finally:
+        conn.close()
+
+    assert seen["metric"] == "operating_margin"
+
+
 # ── period 배선: answer_kr_question이 파싱한 기간을 resolve_metric_fn에 전달 ──────────
 
 def test_answer_kr_question_threads_annual_period_into_resolve_metric(tmp_path):
@@ -768,6 +864,64 @@ def test_answer_kr_question_no_period_does_not_pass_period_kwarg(tmp_path):
         conn.close()
 
     assert result["financial"]["value"] == 12.5
+
+
+# ── 다중분기 배선: answer_kr_question이 여러 분기를 각각 조회해 result["periods"]에 담는다 ──
+# 실서버 재현 버그: "하이닉스 25년과 26년 1분기 영업이익률"이 첫 분기(2025Q1)만 조회하고
+# 둘째(2026Q1)를 통째로 버렸다. 이제 각 분기를 개별 조회해 기간별로 명확히 구분해 담는다.
+
+def test_answer_kr_question_multi_quarter_returns_value_per_period(tmp_path):
+    db = _seed(tmp_path, name="하이닉스", code="000660")
+    seen: list = []
+
+    def spy_resolve_metric(conn, stock_code, metric, llm_fn=None, period=None):
+        seen.append(period)
+        label = period["quarter"] if period and period.get("kind") == "quarter" else None
+        return {
+            "stock_code": stock_code, "metric": metric,
+            "value": 21.0 if label == "2025Q1" else 19.0,
+            "source": "DART", "period": label,
+        }
+
+    conn = connect_readonly(db)
+    try:
+        result = answer_kr_question(
+            "하이닉스 25년과 26년 1분기 영업이익률", conn, resolve_metric_fn=spy_resolve_metric
+        )
+    finally:
+        conn.close()
+
+    # 두 분기 모두 개별 조회됐는가(핵심).
+    assert seen == [
+        {"kind": "quarter", "quarter": "2025Q1"},
+        {"kind": "quarter", "quarter": "2026Q1"},
+    ]
+    periods = result["periods"]
+    assert [p["period"] for p in periods] == ["2025Q1", "2026Q1"]
+    assert periods[0]["financial"]["value"] == 21.0
+    assert periods[1]["financial"]["value"] == 19.0
+    # 다중분기는 기간별로 구분해 담으므로 최상위 financial은 쓰지 않는다(다중종목 entities와 동일 관례).
+    assert result["financial"] is None
+
+
+def test_answer_kr_question_single_quarter_unchanged_no_periods_key(tmp_path):
+    # 회귀: 단일 분기 질문(압도적 다수)은 기존처럼 financial 하나만, periods 키는 없다.
+    db = _seed(tmp_path)
+
+    def spy_resolve_metric(conn, stock_code, metric, llm_fn=None, period=None):
+        return {"stock_code": stock_code, "metric": metric,
+                "value": 12.5, "source": "DART", "period": "2024Q3"}
+
+    conn = connect_readonly(db)
+    try:
+        result = answer_kr_question(
+            "삼성전자 2024년 3분기 PER", conn, resolve_metric_fn=spy_resolve_metric
+        )
+    finally:
+        conn.close()
+
+    assert result["financial"]["value"] == 12.5
+    assert result.get("periods") is None
 
 
 # ── price_history 첨부(버그A): "최근 1년 주가 그래프" 질문에 1년 시계열을 담아 검증 통과 ────
