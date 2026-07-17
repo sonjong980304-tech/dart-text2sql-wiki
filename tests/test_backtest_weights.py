@@ -62,6 +62,51 @@ def test_backward_compat_criteria_mode_unaffected():
     assert len(res["dates"]) == 3
 
 
+def test_engine_forwards_winsorize_z_param_to_select_stocks():
+    """params["winsorize_z"]가 select_stocks까지 배선돼 선정 종목이 바뀌는지 검증(엔진 배선).
+
+    극단치 종목 X는 winsorize 없으면 1위로 선정되지만, params에 winsorize_z=3.0을 주면
+    z-score가 잘려 Y가 1위로 뒤바뀐다 — 백테스트 홀딩스가 그 결과를 그대로 반영해야 한다.
+    """
+    rows = [{"stock_code": f"F{i:02d}", "sector": "화학", "market": "KOSPI",
+             "a": float(i + 1), "b": 5.0} for i in range(24)]
+    rows.append({"stock_code": "Y", "sector": "화학", "market": "KOSPI", "a": 40.0, "b": 5.0})
+    rows.append({"stock_code": "X", "sector": "화학", "market": "KOSPI", "a": 8.0, "b": 4000.0})
+    criteria = [{"key": "a", "direction": "high", "weight": 1.0},
+                {"key": "b", "direction": "high", "weight": 1.0}]
+    base = {"criteria": criteria, "n": 1, "fee_rate": 0.0, "tax_rate": 0.0, "slippage_rate": 0.0}
+
+    without = run_backtest(_DATES, metrics_fn=lambda d: rows, price_fn=lambda d, c: 100.0,
+                           params=base)
+    assert without["holdings"][0]["codes"][0] == "X"
+
+    withw = run_backtest(_DATES, metrics_fn=lambda d: rows, price_fn=lambda d, c: 100.0,
+                         params={**base, "winsorize_z": 3.0})
+    assert withw["holdings"][0]["codes"][0] == "Y"
+
+
+def test_engine_forwards_winsorize_pct_param_to_select_stocks():
+    """params["winsorize_pct"]가 select_stocks까지 배선되는지 검증(퍼센타일 방식 엔진 배선).
+
+    단일 기준 n=1: 클리핑 없으면 원본 최댓값 Q가 선정되지만, winsorize_pct=0.02면 P·Q가
+    같은 경계로 눌려 동점이 돼 순서상 앞선 P가 선정된다 — 홀딩스가 그 결과를 반영해야 한다.
+    """
+    rows = [{"stock_code": f"F{i:02d}", "sector": "화학", "market": "KOSPI", "a": 1.0}
+            for i in range(98)]
+    rows.append({"stock_code": "P", "sector": "화학", "market": "KOSPI", "a": 100.0})
+    rows.append({"stock_code": "Q", "sector": "화학", "market": "KOSPI", "a": 1000.0})
+    criteria = [{"key": "a", "direction": "high", "weight": 1.0}]
+    base = {"criteria": criteria, "n": 1, "fee_rate": 0.0, "tax_rate": 0.0, "slippage_rate": 0.0}
+
+    without = run_backtest(_DATES, metrics_fn=lambda d: rows, price_fn=lambda d, c: 100.0,
+                           params=base)
+    assert without["holdings"][0]["codes"][0] == "Q"
+
+    withp = run_backtest(_DATES, metrics_fn=lambda d: rows, price_fn=lambda d, c: 100.0,
+                         params={**base, "winsorize_pct": 0.02})
+    assert withp["holdings"][0]["codes"][0] == "P"
+
+
 # --------------------------------------------------------------------------
 # 구간수익률(period_return) 저장 — 리밸런싱 구간별 보유종목 수익률을 holdings_log에 남긴다.
 # nav/performance 계산 공식은 불변, period_return은 순수 추가 필드다(기존 감사 로직 무손상).

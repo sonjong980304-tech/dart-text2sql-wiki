@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>올웨더 포트폴리오 · Quant Assistant</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a23; --panel2:#1f2430; --line:#2a2f3c;
+    --text:#e6e9ef; --muted:#8b93a7; --accent:#5b8cff; --accent2:#3ad29f;
+    --warn:#f0a020; --bad:#ff6b6b; --chip:#262c3a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Apple SD Gothic Neo",sans-serif;font-size:14px;line-height:1.5}
+  header{padding:18px 28px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:16px}
+  header h1{font-size:17px;margin:0;font-weight:650;letter-spacing:-.2px}
+  header .home{margin-left:auto;color:var(--muted);font-size:13px;text-decoration:none;
+    background:var(--panel2);border:1px solid var(--line);padding:7px 14px;border-radius:9px;transition:background .12s}
+  header .home:hover{background:var(--chip);color:var(--text)}
+  main{padding:24px 28px;max-width:1000px;margin:0 auto}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:18px}
+  .muted{color:var(--muted)}
+  .spinner{display:inline-block;width:15px;height:15px;border:2px solid var(--line);border-top-color:var(--accent);
+    border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* ===== 요약 히어로 ===== */
+  .hero{display:flex;align-items:center;gap:24px;flex-wrap:wrap}
+  .hero .title{font-size:24px;font-weight:750;letter-spacing:-.4px}
+  .hero .sub{color:var(--muted);font-size:13px;margin-top:2px}
+  .asof{color:var(--muted);font-size:12.5px;margin-left:auto;text-align:right}
+
+  /* ===== 비중 바 ===== */
+  .weights{display:flex;flex-direction:column;gap:12px;margin-top:12px}
+  .wrow{display:grid;grid-template-columns:150px 1fr 64px;align-items:center;gap:12px}
+  .wname{font-size:13.5px;font-weight:600}
+  .wbar{background:var(--panel2);border:1px solid var(--line);border-radius:8px;height:20px;overflow:hidden}
+  .wfill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:8px 0 0 8px}
+  .wpct{text-align:right;font-variant-numeric:tabular-nums;font-weight:650;font-size:13.5px}
+
+  /* ===== 지표 카드 ===== */
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}
+  .metric{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .metric .l{color:var(--muted);font-size:12.5px}
+  .metric .v{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;margin:4px 0 2px}
+  .metric .v.good{color:var(--accent2)} .metric .v.bad{color:var(--bad)}
+  .note-ref{color:var(--muted);font-size:11.5px;margin-top:6px}
+
+  /* ===== 고지 ===== */
+  .disclaimer{border-left:3px solid var(--warn);background:rgba(240,160,32,.06)}
+  .disclaimer b{color:var(--warn)}
+  .disclaimer ul{margin:8px 0 0;padding-left:18px;color:var(--muted)}
+  .disclaimer li{margin:3px 0}
+  .curve-wrap{margin-top:8px}
+  footer{text-align:center;color:var(--muted);font-size:11px;margin:24px 0 8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🌦️ 올웨더 포트폴리오 <span class="muted" style="font-weight:400">몬테카를로 최적화 · walk-forward 백테스트</span></h1>
+  <a class="home" href="/">← 홈으로</a>
+</header>
+
+<main>
+  <!-- 요약 -->
+  <div class="card">
+    <div class="hero">
+      <div>
+        <div class="title" id="heroTitle">로딩…</div>
+        <div class="sub" id="heroSub"><span class="spinner"></span> /api/allweather 조회 중</div>
+      </div>
+      <div class="asof" id="asof"></div>
+    </div>
+  </div>
+
+  <!-- 목표 비중 -->
+  <div class="card">
+    <b>목표 비중</b> <span class="muted" style="font-size:12.5px">· 최근 리밸런싱 시점 몬테카를로(10만회) 최적 비중</span>
+    <div class="weights" id="weights"><span class="muted" style="font-size:12.5px">비중 로딩…</span></div>
+  </div>
+
+  <!-- 성과 지표 -->
+  <div class="card">
+    <b>성과 지표</b> <span class="muted" style="font-size:12.5px">· 실제 10년 walk-forward 백테스트 곡선 기준</span>
+    <div class="grid" style="margin-top:12px">
+      <div class="metric">
+        <div class="l">CAGR (연평균 복리수익)</div>
+        <div class="v" id="cagrV">–</div>
+      </div>
+      <div class="metric">
+        <div class="l">MDD (최대낙폭)</div>
+        <div class="v" id="mddV">–</div>
+      </div>
+      <div class="metric">
+        <div class="l">샤프비율</div>
+        <div class="v" id="sharpeV">–</div>
+        <div class="note-ref">무위험이자율: 미국 3개월 국채(^IRX) 시점별 값</div>
+      </div>
+      <div class="metric">
+        <div class="l">누적수익률</div>
+        <div class="v" id="cumV">–</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 자산곡선 -->
+  <div class="card">
+    <b>자산곡선 (NAV)</b> <span class="muted" style="font-size:12.5px">· walk-forward 누적 (시작 = 1.0)</span>
+    <div class="curve-wrap" id="curve"><span class="muted" style="font-size:12.5px">곡선 로딩…</span></div>
+  </div>
+
+  <!-- 고지 -->
+  <div class="card disclaimer">
+    <b>⚠ 모니터링 화면입니다 — 자동 주문은 없습니다</b>
+    <ul>
+      <li>이 화면은 매달 1일 배치가 계산해 저장한 값을 <b>읽기만</b> 합니다. 접속 시 즉석 재계산하지 않습니다.</li>
+      <li>비중·지표는 실제 10년 가격으로 walk-forward 백테스트(각 시점까지 데이터만 사용, 미래참조 없음)해 산출합니다.</li>
+      <li>실제 매수·매도 주문 실행은 이 기능의 범위 밖입니다(별도 운용 시스템 영역).</li>
+    </ul>
+  </div>
+
+  <footer>made by 규영 · 4종목(QQQ/삼성전자/TLT/ACE KRX금현물) 몬테카를로 리밸런싱</footer>
+</main>
+
+<script>
+// ngrok 무료 경고 페이지 우회(macro.html과 동일): 모든 fetch에 헤더 주입
+(function(){const _f=window.fetch;window.fetch=(u,o)=>{o=o||{};o.headers=Object.assign({},o.headers,{'ngrok-skip-browser-warning':'true'});return _f(u,o);};})();
+
+const NAMES = {
+  "QQQ":"QQQ (나스닥 ETF)",
+  "005930.KS":"삼성전자",
+  "TLT":"TLT (미국 장기채)",
+  "411060.KS":"ACE KRX금현물",
+};
+const ORDER = ["QQQ","005930.KS","TLT","411060.KS"];
+function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function pct(v,d){ return (v==null)?'–':(v*100).toLocaleString(undefined,{maximumFractionDigits:d==null?1:d})+'%'; }
+
+async function load(){
+  try{
+    const d = await (await fetch('/api/allweather')).json();
+    if(!d.available){
+      document.getElementById('heroTitle').textContent = '아직 계산된 스냅샷이 없습니다';
+      document.getElementById('heroSub').textContent = '매달 1일 배치가 실행되면 여기에 표시됩니다.';
+      document.getElementById('weights').innerHTML = '<span class="muted" style="font-size:12.5px">데이터 없음</span>';
+      document.getElementById('curve').innerHTML = '<span class="muted" style="font-size:12.5px">데이터 없음</span>';
+      return;
+    }
+    document.getElementById('heroTitle').textContent = '올웨더 포트폴리오';
+    document.getElementById('heroSub').textContent = '매달 1일 배치가 저장한 최신 비중과 백테스트 성과입니다.';
+    document.getElementById('asof').textContent = d.computed_at ? ('계산 기준일 ' + esc(d.computed_at)) : '';
+
+    // 비중 바
+    const w = d.weights || {};
+    const keys = ORDER.filter(k=>k in w).concat(Object.keys(w).filter(k=>!ORDER.includes(k)));
+    const maxw = Math.max(0.0001, ...keys.map(k=>w[k]||0));
+    document.getElementById('weights').innerHTML = keys.map(k=>{
+      const val = w[k]||0;
+      const width = Math.round(val/maxw*100);
+      return `<div class="wrow">
+        <div class="wname">${esc(NAMES[k]||k)}</div>
+        <div class="wbar"><div class="wfill" style="width:${width}%"></div></div>
+        <div class="wpct">${pct(val,1)}</div>
+      </div>`;
+    }).join('');
+
+    // 성과 지표
+    const cagrEl=document.getElementById('cagrV'); cagrEl.textContent=pct(d.cagr,1); cagrEl.className='v '+((d.cagr||0)>=0?'good':'bad');
+    const mddEl=document.getElementById('mddV'); mddEl.textContent=pct(d.mdd,1); mddEl.className='v bad';
+    document.getElementById('sharpeV').textContent = (d.sharpe==null)?'–':Number(d.sharpe).toLocaleString(undefined,{maximumFractionDigits:2});
+    const cumEl=document.getElementById('cumV'); cumEl.textContent=pct(d.cumulative_return,1); cumEl.className='v '+((d.cumulative_return||0)>=0?'good':'bad');
+
+    drawCurve(d.backtest_curve||[]);
+  }catch(e){
+    document.getElementById('heroTitle').textContent = '조회 실패';
+    document.getElementById('heroSub').textContent = String(e);
+  }
+}
+
+function drawCurve(curve){
+  const el = document.getElementById('curve');
+  const pts = (curve||[]).filter(p=>p && p.nav!=null);
+  if(pts.length < 2){ el.innerHTML = '<span class="muted" style="font-size:12.5px">곡선을 그릴 데이터가 부족합니다.</span>'; return; }
+  const vals = pts.map(p=>p.nav);
+  const w=920, ht=280, padL=52, padR=16, padT=16, padB=30;
+  const plotW=w-padL-padR, plotH=ht-padT-padB;
+  const rawMin=Math.min(...vals), rawMax=Math.max(...vals);
+  const span=(rawMax-rawMin)||Math.abs(rawMax)*0.1||1;
+  const max=rawMax+span*0.1, min=Math.max(0, rawMin-span*0.1);
+  const X=i=>padL+i*plotW/(pts.length-1);
+  const Y=v=>padT+plotH-(v-min)/(max-min)*plotH;
+  const path=vals.map((v,i)=>`${i?'L':'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+  const area=`${path} L${X(pts.length-1).toFixed(1)},${(padT+plotH).toFixed(1)} L${X(0).toFixed(1)},${(padT+plotH).toFixed(1)} Z`;
+
+  const TICKS=4; let yAxis='';
+  for(let t=0;t<=TICKS;t++){
+    const v=min+(max-min)*t/TICKS; const y=Y(v).toFixed(1);
+    yAxis+=`<line x1="${padL}" y1="${y}" x2="${w-padR}" y2="${y}" stroke="#2a2f3c" stroke-width="1"/>`;
+    yAxis+=`<text x="${padL-8}" y="${(+y+3.5).toFixed(1)}" fill="#8b93a7" font-size="11" text-anchor="end">${v.toFixed(2)}</text>`;
+  }
+  const N=pts.length, xTickCount=Math.min(6,N); let xAxis='';
+  for(let t=0;t<xTickCount;t++){
+    const i=xTickCount===1?0:Math.round(t*(N-1)/(xTickCount-1));
+    const x=X(i).toFixed(1);
+    const anchor = t===0 ? 'start' : (t===xTickCount-1 ? 'end' : 'middle');
+    xAxis+=`<line x1="${x}" y1="${padT}" x2="${x}" y2="${padT+plotH}" stroke="#2a2f3c" stroke-width="1"/>`;
+    xAxis+=`<text x="${x}" y="${(padT+plotH+18).toFixed(1)}" fill="#8b93a7" font-size="11" text-anchor="${anchor}">${esc(String(pts[i].date).slice(0,7))}</text>`;
+  }
+  el.innerHTML = `<svg viewBox="0 0 ${w} ${ht}" style="width:100%;height:auto;margin-top:6px">
+    ${yAxis}${xAxis}
+    <path d="${area}" fill="rgba(91,140,255,.12)" stroke="none"/>
+    <path d="${path}" fill="none" stroke="#5b8cff" stroke-width="2.5"/>
+  </svg>`;
+}
+
+load();
+</script>
+</body>
+</html>

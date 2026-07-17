@@ -299,6 +299,23 @@ CREATE TABLE IF NOT EXISTS macro_signal (
     prev_overall  TEXT,            -- 직전 판정의 overall (알림 변경감지·이력용)
     created_at    TEXT             -- 판정 생성 시각 (ISO)
 );
+
+-- 올웨더 포트폴리오 모니터링 스냅샷 이력. 매달 1일 배치가 실제 10년 walk-forward 백테스트로
+-- 계산한 결과(비중/MDD/CAGR/누적수익률/샤프)를 월별 1행 append(UPDATE 아님)로 쌓는다 —
+-- 텔레그램 델타(직전 달 대비 비중 변경분) 계산이 이 이력에 의존한다. 화면은 이 저장값을
+-- 읽기만 하고 즉석 재계산하지 않는다. 자연어 SQL 질의 대상 아님(QUERYABLE_TABLES 미포함 —
+-- macro/metrics와 동일 관례). .omc/specs/brainstorming-all-weather-portfolio.md 참고.
+CREATE TABLE IF NOT EXISTS all_weather_snapshot (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    computed_at       TEXT NOT NULL,   -- 배치 실행일 (YYYY-MM-DD)
+    weights           TEXT,            -- 종목별 목표비중 (JSON 오브젝트, 티커→비중)
+    cagr              REAL,            -- 연평균 복리 수익률 (소수, walk-forward 곡선 기준)
+    mdd               REAL,            -- 최대낙폭 (소수, 0 이하)
+    sharpe            REAL,            -- 샤프비율 (실현 곡선 기준, 시점별 ^IRX 무위험이자율 반영)
+    cumulative_return REAL,            -- 누적수익률 (소수)
+    backtest_curve    TEXT,            -- 자산곡선 (JSON 배열, 각 원소 date/nav)
+    created_at        TEXT             -- 생성 시각 (ISO)
+);
 """
 
 # 읽기 전용 쿼리에 노출되는 테이블 (Text-to-SQL 대상).

@@ -165,3 +165,113 @@ def test_sector_neutral_ignored_for_and_combine():
         _two_sector_momentum_rows(), criteria, combine="and", n=3, sector_neutral=True
     )
     assert isinstance(picked, list)
+
+
+# ── 이상치 완화(winsorize_z): z-score를 [-w, +w]로 클리핑 ─────────────────────
+# 집중된 소수 종목 포트폴리오에서 극단치 하나가 z-score 조합 점수를 지배하는 문제(2021~22
+# 코스피 소형주 약세장에서 관측)를 완화한다. winsorize_z=None(기본값)이면 기존 z-score
+# 계산과 100% 동일해야 한다(회귀 없음). 값이 주어지면 각 criterion의 z-score를
+# [-winsorize_z, +winsorize_z]로 클리핑한 뒤 가중합한다.
+def _outlier_rows_for_winsorize():
+    """cluster(F00~F23) + Y(a 우수·b 평균) + X(a 열위·b 극단치).
+
+    a·b 모두 direction=high, 동일 가중. winsorize 없으면 X의 극단적 b(z≈5)가 지배해 X가 1위,
+    winsorize_z=3.0이면 X의 b가 z=3으로 잘려 열위인 a가 드러나 Y가 1위로 뒤바뀐다(순위 역전).
+    """
+    rows = [
+        {"stock_code": f"F{i:02d}", "a": float(i + 1), "b": 5.0} for i in range(24)
+    ]
+    rows.append({"stock_code": "Y", "a": 40.0, "b": 5.0})     # a 우수(z≈3.1), b 평균
+    rows.append({"stock_code": "X", "a": 8.0, "b": 4000.0})   # a 열위, b 극단치(z≈5)
+    return rows
+
+
+_WINSORIZE_CRITERIA = [
+    {"key": "a", "direction": "high", "weight": 1.0},
+    {"key": "b", "direction": "high", "weight": 1.0},
+]
+
+
+def test_winsorize_z_none_matches_default_exactly():
+    """winsorize_z=None(기본값)은 인자를 아예 넘기지 않은 기존 동작과 종목/점수가 완전히 동일(회귀)."""
+    criteria = [{"key": "per", "direction": "low", "weight": 0.5},
+                {"key": "roe", "direction": "high", "weight": 0.5}]
+    default = select_stocks(_fake_rows(), criteria, combine="zscore", n=3)
+    explicit = select_stocks(_fake_rows(), criteria, combine="zscore", n=3, winsorize_z=None)
+    assert [r["stock_code"] for r in default] == [r["stock_code"] for r in explicit]
+    assert [r["_score"] for r in default] == [r["_score"] for r in explicit]
+
+
+def test_winsorize_z_clips_extreme_zscore_to_threshold():
+    """단일 기준 극단치: winsorize_z=3.0이면 그 종목의 z-score가 정확히 3으로 잘려 _score=-3.0.
+
+    winsorize 없이는 z≈4.9라 _score가 -3.0보다 더 극단적이다(클리핑이 실제로 값을 눌렀음을 확인)."""
+    rows = [{"stock_code": f"F{i:02d}", "a": 1.0} for i in range(24)]
+    rows.append({"stock_code": "OUT", "a": 1000.0})  # 극단치(z≈4.9 > 3)
+    criteria = [{"key": "a", "direction": "high", "weight": 1.0}]
+
+    without = select_stocks(rows, criteria, combine="zscore", n=1)
+    assert without[0]["stock_code"] == "OUT"
+    assert without[0]["_score"] < -3.0  # 클리핑 없으면 z≈4.9 → _score≈-4.9
+
+    clipped = select_stocks(rows, criteria, combine="zscore", n=1, winsorize_z=3.0)
+    assert clipped[0]["stock_code"] == "OUT"
+    assert clipped[0]["_score"] == -3.0  # z가 정확히 3으로 잘림 → _score=-3.0
+
+
+def test_winsorize_z_changes_ranking_when_outlier_dominates():
+    """멀티팩터: 극단치 종목(X)이 winsorize 없이는 1위지만, winsorize_z=3.0이면 순위가 역전된다."""
+    rows = _outlier_rows_for_winsorize()
+    without = select_stocks(rows, _WINSORIZE_CRITERIA, combine="zscore", n=2)
+    assert without[0]["stock_code"] == "X"  # 극단적 b가 지배 → X 1위
+
+    clipped = select_stocks(rows, _WINSORIZE_CRITERIA, combine="zscore", n=2, winsorize_z=3.0)
+    assert clipped[0]["stock_code"] == "Y"  # X의 b가 z=3으로 잘려 열위한 a가 드러남 → Y 1위
+
+
+# ── 퍼센타일 기반 이상치 완화(winsorize_pct): 원본값을 상하위 pct 퍼센타일로 클리핑한 뒤
+#    z-score를 계산한다(교과서적 winsorization 순서 — 값을 먼저 자르고 표준화). winsorize_z
+#    (z-score 자체를 자름)와는 별개 파라미터이며, winsorize_pct=None(기본값)이면 기존 동작과
+#    100% 동일하다(회귀 없음). pct=0.01 → 상하위 1%(1·99 퍼센타일)에서 클리핑.
+def _pct_outlier_rows():
+    """98개 filler(a=1) + P(a=100) + Q(a=1000). 둘 다 상위 tail이라 pct 클리핑 시 같은 경계로
+    잘려 동일 z가 된다(상위 2% = P,Q). direction=high, 단일 기준."""
+    rows = [{"stock_code": f"F{i:02d}", "a": 1.0} for i in range(98)]
+    rows.append({"stock_code": "P", "a": 100.0})
+    rows.append({"stock_code": "Q", "a": 1000.0})
+    return rows
+
+
+def test_winsorize_pct_none_matches_default_exactly():
+    """winsorize_pct=None(기본값)은 인자를 아예 넘기지 않은 기존 동작과 종목/점수가 완전히 동일(회귀)."""
+    criteria = [{"key": "per", "direction": "low", "weight": 0.5},
+                {"key": "roe", "direction": "high", "weight": 0.5}]
+    default = select_stocks(_fake_rows(), criteria, combine="zscore", n=3)
+    explicit = select_stocks(_fake_rows(), criteria, combine="zscore", n=3, winsorize_pct=None)
+    assert [r["stock_code"] for r in default] == [r["stock_code"] for r in explicit]
+    assert [r["_score"] for r in default] == [r["_score"] for r in explicit]
+
+
+def test_winsorize_pct_clips_raw_values_at_percentile_before_zscore():
+    """상위 tail 두 종목(P·Q)은 원본값(100 vs 1000)이 달라도, pct 클리핑 후 같은 퍼센타일
+    경계로 눌려 z-score(=_score)가 동일해진다 — 원본값이 실제로 잘렸다는 직접 증거."""
+    rows = _pct_outlier_rows()
+    criteria = [{"key": "a", "direction": "high", "weight": 1.0}]
+
+    without = select_stocks(rows, criteria, combine="zscore", n=3)
+    by = {r["stock_code"]: r["_score"] for r in without}
+    assert by["P"] != by["Q"]  # 클리핑 없으면 원본값 차이(100 vs 1000)가 z에 그대로 반영
+
+    clipped = select_stocks(rows, criteria, combine="zscore", n=3, winsorize_pct=0.02)
+    byc = {r["stock_code"]: r["_score"] for r in clipped}
+    assert byc["P"] == byc["Q"]  # 둘 다 상위 2%라 같은 경계로 잘림 → 동일 z
+
+
+def test_winsorize_pct_changes_top_pick_when_tail_collapses():
+    """단일 기준 n=1: 클리핑 없으면 원본 최댓값(Q)이 1위, pct=0.02면 P·Q가 동점이 돼 순서상
+    앞선 P가 1위로 바뀐다(퍼센타일 클리핑이 선정 결과에 실제로 영향)."""
+    rows = _pct_outlier_rows()
+    criteria = [{"key": "a", "direction": "high", "weight": 1.0}]
+    assert select_stocks(rows, criteria, combine="zscore", n=1)[0]["stock_code"] == "Q"
+    assert select_stocks(rows, criteria, combine="zscore", n=1,
+                         winsorize_pct=0.02)[0]["stock_code"] == "P"

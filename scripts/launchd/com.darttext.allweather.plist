@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.darttext.allweather</string>
+
+    <!-- 올웨더 포트폴리오 모니터링. 매달 1일 08:10 1회 —
+         .omc/specs/brainstorming-all-weather-portfolio.md AC10.
+         4종목(QQQ/삼성전자/TLT/ACE KRX금현물) walk-forward 백테스트(몬테카를로 10만회 ×
+         리밸런싱 시점 약 120회)를 돌려 비중/MDD/CAGR/누적수익률/샤프를 계산해
+         all_weather_snapshot에 이력 저장하고, quant_trader와 동일한 텔레그램 채널로
+         직전 달 대비 델타 포함 알림 발송. macroindicators(매일 07:40)와 시간대가 겹치지
+         않게 08:10으로 둔다. caffeinate -s로 실행 중 잠들지 않게 한다. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-s</string>
+        <string>/Users/gyuyeong/projects/.venv/bin/python3</string>
+        <string>/Users/gyuyeong/projects/dart-text2sql-wiki/scripts/run_all_weather.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/gyuyeong/projects/dart-text2sql-wiki</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Day</key><integer>1</integer>
+        <key>Hour</key><integer>8</integer>
+        <key>Minute</key><integer>10</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/gyuyeong/projects/dart-text2sql-wiki/data/logs/all_weather.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/gyuyeong/projects/dart-text2sql-wiki/data/logs/all_weather.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/gyuyeong/projects/.venv/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/gyuyeong</string>
+    </dict>
+</dict>
+</plist>

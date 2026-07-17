@@ -637,9 +637,48 @@ def api_macro_history(days: int = 30):
 
 
 # ---------------------------------------------------------------------------
+# 올웨더 포트폴리오 모니터링 — 저장된 스냅샷 읽기 전용 (AC11/AC14).
+# 매달 1일 배치(scripts/run_all_weather.py)가 계산해 all_weather_snapshot에 저장한 값을
+# 그대로 노출한다. 조회 시 즉석 재계산을 하지 않는다(macro_signal과 동일 캐싱 원칙).
+# .omc/specs/brainstorming-all-weather-portfolio.md 참고.
+# ---------------------------------------------------------------------------
+@app.get("/api/allweather")
+def api_allweather():
+    """최신 올웨더 스냅샷(비중/MDD/샤프/누적수익률/CAGR + 자산곡선)을 DB에서 읽어 반환한다.
+
+    화면은 이 저장값을 읽기만 하고 즉석 재계산하지 않는다(AC11). 이력이 없으면 available=False로 200.
+    """
+    from src.allweather.store import get_latest_snapshot
+
+    conn = connect()
+    try:
+        snap = get_latest_snapshot(conn)
+    finally:
+        conn.close()
+    if snap is None:
+        return {
+            "available": False, "computed_at": None, "weights": {},
+            "cagr": None, "mdd": None, "sharpe": None, "cumulative_return": None,
+            "backtest_curve": [],
+        }
+    return {
+        "available": True,
+        "computed_at": snap["computed_at"],
+        "weights": snap["weights"],
+        "cagr": snap["cagr"],
+        "mdd": snap["mdd"],
+        "sharpe": snap["sharpe"],
+        "cumulative_return": snap["cumulative_return"],
+        "backtest_curve": snap["backtest_curve"],
+        "created_at": snap["created_at"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # 백테스트 (모듈 B)
 # ---------------------------------------------------------------------------
 class BacktestReq(BaseModel):
+    domain: str = "kr"            # 'kr'(KOSPI/KOSDAQ) | 'us'(NASDAQ/NYSE/NYSE Amex). 기본 kr(회귀 보존)
     start_year: int = 2024
     end_year: int = 2026
     rebalance: str = "quarterly"
@@ -647,7 +686,9 @@ class BacktestReq(BaseModel):
     criteria: list = []           # [{"key","direction","weight"}]
     combine: str = "zscore"
     sectors: Optional[list] = None
-    markets: Optional[list] = None     # ['KOSPI','KOSDAQ'] 또는 None(전체)
+    markets: Optional[list] = None     # kr: ['KOSPI','KOSDAQ'] / us: ['NASDAQ','NYSE','NYSE Amex'] / None(전체)
+    winsorize_z: Optional[float] = None  # z-score 이상치 완화 임계값(None이면 미적용, 기존 동작)
+    winsorize_pct: Optional[float] = None  # 원본값 퍼센타일 winsorize(예: 0.01=상하위 1%, None이면 미적용)
     name: str = "전략"
     fee_rate: Optional[float] = None       # 수수료율(비율). None이면 서버 기본값
     tax_rate: Optional[float] = None       # 매도 거래세율(비율)
@@ -665,11 +706,15 @@ def api_metric_defs():
 
 
 @app.get("/api/sectors")
-def api_sectors():
+def api_sectors(domain: str = "kr"):
+    # kr: company(KRX 업종분류) / us: us_company(원본 taxonomy). 그 외 값은 사용자 입력 오류(400).
+    if domain not in ("kr", "us"):
+        raise HTTPException(400, "domain은 'kr' 또는 'us'여야 합니다.")
+    table = "company" if domain == "kr" else "us_company"
     conn = connect()
     try:
         return [r["sector"] for r in conn.execute(
-            "SELECT DISTINCT sector FROM company WHERE sector IS NOT NULL AND sector != '' ORDER BY sector")]
+            f"SELECT DISTINCT sector FROM {table} WHERE sector IS NOT NULL AND sector != '' ORDER BY sector")]
     finally:
         conn.close()
 
@@ -679,8 +724,19 @@ def api_backtest(req: BacktestReq):
     from src.backtest.data_access import build_benchmark_fn, build_callbacks, rebalance_dates
     from src.backtest.engine import run_backtest, save_backtest_run
 
+    # domain(kr|us): KR(KOSPI/KOSDAQ)와 US(NASDAQ/NYSE/NYSE Amex)는 통화·데이터소스가 달라
+    # 한 백테스트에서 섞지 않는다(프런트도 배타적 토글). 기본 'kr'로 기존 동작 100% 보존.
+    if req.domain not in ("kr", "us"):
+        raise HTTPException(400, "domain은 'kr' 또는 'us'여야 합니다.")
     if not req.criteria:
         raise HTTPException(400, "지표를 1개 이상 선택하세요.")
+    # markets 검증: 도메인별 허용 시장 외 값이 섞이면 사용자 입력 오류(400). markets=None(전체)은 통과.
+    allowed_markets = {"KOSPI", "KOSDAQ"} if req.domain == "kr" else {"NASDAQ", "NYSE", "NYSE Amex"}
+    if req.markets:
+        invalid = [m for m in req.markets if m not in allowed_markets]
+        if invalid:
+            raise HTTPException(
+                400, f"허용되지 않는 시장 {invalid} (domain={req.domain}, 허용: {sorted(allowed_markets)})")
     # UI 지표 목록(metric_def)의 'momentum'(가격모멘텀)은 백테스트 단면에 그 이름의 필드가
     # 없다(있는 것은 return_12m — 직전 12개월 가격수익률). 도메인 스크리닝 경로(domain_kr.py의
     # "모멘텀"→return_12m)와 동일 규약으로 여기서 별칭 치환한다. 치환이 없으면 selection.py의
@@ -689,7 +745,9 @@ def api_backtest(req: BacktestReq):
                 for c in req.criteria]
     conn = connect()
     try:
-        maxd = conn.execute("SELECT MAX(date) FROM prices").fetchone()[0]
+        # 가격 최신일(리밸런싱 날짜 절단 기준)은 도메인별 가격 테이블에서 뽑는다(KR=prices, US=us_prices).
+        price_table = "prices" if req.domain == "kr" else "us_prices"
+        maxd = conn.execute(f"SELECT MAX(date) FROM {price_table}").fetchone()[0]
         full = rebalance_dates(req.start_year, req.end_year, req.rebalance)
         dates = [d for d in full if maxd and d <= maxd]
         # 진행 중(미완결) 구간 이어붙이기: 사용자가 요청한 마지막 리밸런싱이 아직 오지 않은
@@ -703,18 +761,28 @@ def api_backtest(req: BacktestReq):
             dates = dates + [maxd]
         if len(dates) < 2:
             raise HTTPException(400, "선택 기간에 데이터가 부족합니다(주가 시계열 범위 확인).")
-        mfn, pfn = build_callbacks(conn)
-        bench_fn = build_benchmark_fn(dates, mfn, pfn)
+        # 도메인별 엔진 콜백/벤치마크. US는 us_company/us_prices/us_financials 어댑터를 쓰고
+        # 벤치마크로 S&P500 실제지수(^GSPC)를 쓴다(동일가중 유니버스 벤치마크가 아님).
+        if req.domain == "us":
+            from src.backtest.data_access_us import build_callbacks_us, build_sp500_benchmark_fn
+            mfn, pfn = build_callbacks_us(conn)
+            bench_fn = build_sp500_benchmark_fn(dates)
+            names_sql = "SELECT stock_code,name FROM us_company"
+        else:
+            mfn, pfn = build_callbacks(conn)
+            bench_fn = build_benchmark_fn(dates, mfn, pfn)
+            names_sql = "SELECT stock_code,name FROM company"
         params = {
             "n": req.n, "criteria": criteria, "combine": req.combine,
-            "sectors": req.sectors, "markets": req.markets, "rebalance": req.rebalance,
+            "sectors": req.sectors, "markets": req.markets, "winsorize_z": req.winsorize_z,
+            "winsorize_pct": req.winsorize_pct, "rebalance": req.rebalance,
             "fee_rate": req.fee_rate if req.fee_rate is not None else CONFIG.fee_rate,
             "tax_rate": req.tax_rate if req.tax_rate is not None else CONFIG.tax_rate,
             "slippage_rate": req.slippage_rate if req.slippage_rate is not None else CONFIG.slippage_rate,
         }
         res = run_backtest(dates, mfn, pfn, params, benchmark_fn=bench_fn)
         save_backtest_run(conn, req.name, params, res["performance"], req.start_year, req.end_year)
-        names = {r["stock_code"]: r["name"] for r in conn.execute("SELECT stock_code,name FROM company")}
+        names = {r["stock_code"]: r["name"] for r in conn.execute(names_sql)}
         holdings = [{"date": h["date"], "names": [names.get(c, c) for c in h["codes"]]}
                     for h in res["holdings"]]
         return {"dates": res["dates"], "navs": res["navs"], "benchmark": res.get("benchmark"),
@@ -769,6 +837,12 @@ def query_page():
 def macro_page():
     """매크로 신호 전용 페이지(index.html과 동일 패턴으로 정적 HTML 서빙)."""
     return FileResponse(STATIC_DIR / "macro.html")
+
+
+@app.get("/allweather")
+def allweather_page():
+    """올웨더 포트폴리오 모니터링 페이지(macro.html과 동일 패턴으로 정적 HTML 서빙)."""
+    return FileResponse(STATIC_DIR / "allweather.html")
 
 
 if STATIC_DIR.exists():

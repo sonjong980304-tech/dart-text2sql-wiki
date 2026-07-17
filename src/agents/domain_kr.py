@@ -918,10 +918,15 @@ def _run_screening(
     compare = result["sector_neutral_compare"]
 
     def _combine(criteria: list[dict], sn: bool):
+        # 멀티팩터(2개 이상) z-score 조합 스크리닝에는 백테스트 엔진과 동일하게 z-score 이상치
+        # 완화(winsorize_z=3.0)를 기본 적용한다 — 실시간 매수후보 스크리닝과 백테스트가 똑같은
+        # 이상치 처리를 받아야 결과가 일관되기 때문. 단일 criterion(단순 정렬)은 z-score 클리핑이
+        # 순위에 영향을 주지 않으므로 미적용(None)해 기존 동작을 보존한다(회귀 방지).
+        winsorize_z = 3.0 if len(criteria) >= 2 else None
         return combine_fn(
             rows, criteria, method="zscore",
             n=spec["top_n"], sectors=requested_sectors, markets=market_filter,
-            sector_neutral=sn,
+            sector_neutral=sn, winsorize_z=winsorize_z,
         )
 
     def _extreme_criteria() -> tuple[list[dict], list[dict]]:

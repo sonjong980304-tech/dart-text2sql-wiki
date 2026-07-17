@@ -34,6 +34,8 @@ def run_backtest(
     combine = params.get("combine", "zscore")
     sectors = params.get("sectors")
     markets = params.get("markets")        # 시장 필터 ['KOSPI','KOSDAQ'] 또는 None(전체)
+    winsorize_z = params.get("winsorize_z")  # z-score 이상치 완화 임계값(None이면 미적용, 기존 동작)
+    winsorize_pct = params.get("winsorize_pct")  # 원본값 퍼센타일 winsorize(None이면 미적용, 기존 동작)
     rebalance = params.get("rebalance", "quarterly")
 
     fee = params.get("fee_rate", 0.00015)
@@ -59,7 +61,8 @@ def run_backtest(
     for i in range(len(rebalance_dates) - 1):
         t, t_next = rebalance_dates[i], rebalance_dates[i + 1]
         rows = metrics_fn(t)
-        selected = select_stocks(rows, criteria, combine, n, sectors, markets)
+        selected = select_stocks(rows, criteria, combine, n, sectors, markets,
+                                 winsorize_z=winsorize_z, winsorize_pct=winsorize_pct)
         codes = [r["stock_code"] for r in selected]
         holdings_log.append({"date": t, "codes": codes})
         if not codes:

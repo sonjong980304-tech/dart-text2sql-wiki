@@ -809,6 +809,42 @@ def test_answer_us_screening_passes_sector_neutral_true_to_combine():
     assert captured.get("sector_neutral") is True
 
 
+# ── winsorize 기본 적용: 멀티팩터(2개 이상) z-score 스크리닝은 백테스트와 동일하게
+#    winsorize_z=3.0을 자동 적용한다(실시간 스크리닝-백테스트 이상치 처리 일관성). 단일
+#    criterion(단순 정렬)에는 적용하지 않는다(회귀 방지) ────────────────────────
+def test_answer_kr_screening_applies_default_winsorize_for_multi_criteria():
+    llm = _json_llm({
+        "criteria": [{"key": "per", "direction": "low"}, {"key": "roe", "direction": "high"}],
+        "top_n": 2,
+    })
+    captured = {}
+
+    def fake_combine(rows, criteria, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    answer_kr_screening(
+        "PER 낮고 ROE 높은 2개", conn=None, llm_fn=llm,
+        cross_section_fn=_fake_rows, combine_fn=fake_combine, asof="2026-07-14",
+    )
+    assert captured.get("winsorize_z") == 3.0
+
+
+def test_answer_kr_screening_no_winsorize_for_single_criterion():
+    llm = _json_llm({"criteria": [{"key": "per", "direction": "low"}], "top_n": 2})
+    captured = {}
+
+    def fake_combine(rows, criteria, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    answer_kr_screening(
+        "PER 낮은 2개", conn=None, llm_fn=llm,
+        cross_section_fn=_fake_rows, combine_fn=fake_combine, asof="2026-07-14",
+    )
+    assert captured.get("winsorize_z") is None
+
+
 # ── 극값(최댓값/최솟값/최고/최저) 질문 → 스크리닝 경로 인식·처리 ─────────────────────
 # 배경: "국내 주식의 PBR의 최댓값과 최솟값을 알려줘"처럼 종목명 없이 지표의 극값만 묻는
 # 질문은 (a) find_stock_code가 실패해 단일종목 경로가 막히고 (b) 개수/랭킹 신호가 없어

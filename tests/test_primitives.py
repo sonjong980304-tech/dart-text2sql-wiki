@@ -307,6 +307,33 @@ def test_combine_wraps_select_stocks_multifactor():
     assert all("_score" in r for r in picked)
 
 
+def test_combine_forwards_winsorize_z_to_select_stocks():
+    """combine이 winsorize_z를 select_stocks까지 전달하는지 배선 검증(백테스트/실시간 일관성)."""
+    rows = [{"stock_code": f"F{i:02d}", "a": float(i + 1), "b": 5.0} for i in range(24)]
+    rows.append({"stock_code": "Y", "a": 40.0, "b": 5.0})
+    rows.append({"stock_code": "X", "a": 8.0, "b": 4000.0})  # a 열위, b 극단치
+    criteria = [{"key": "a", "direction": "high", "weight": 1.0},
+                {"key": "b", "direction": "high", "weight": 1.0}]
+    # winsorize 없으면 극단치 X가 1위, winsorize_z=3.0을 넘기면 Y로 역전돼야 배선이 살아있는 것.
+    assert combine(rows, criteria, method="zscore", n=2)[0]["stock_code"] == "X"
+    assert combine(rows, criteria, method="zscore", n=2, winsorize_z=3.0)[0]["stock_code"] == "Y"
+
+
+def test_combine_forwards_winsorize_pct_to_select_stocks():
+    """combine이 winsorize_pct를 select_stocks까지 전달하는지 배선 검증(퍼센타일 방식)."""
+    from src.backtest.selection import select_stocks
+    rows = [{"stock_code": f"F{i:02d}", "a": 1.0} for i in range(98)]
+    rows.append({"stock_code": "P", "a": 100.0})
+    rows.append({"stock_code": "Q", "a": 1000.0})
+    criteria = [{"key": "a", "direction": "high", "weight": 1.0}]
+    via_combine = combine(rows, criteria, method="zscore", n=3, winsorize_pct=0.02)
+    via_direct = select_stocks(rows, criteria, combine="zscore", n=3, winsorize_pct=0.02)
+    no_pct = combine(rows, criteria, method="zscore", n=3)
+    # combine 결과가 select_stocks 직접 호출과 동일하고, pct 미적용과는 달라야 배선이 살아있는 것.
+    assert [r["_score"] for r in via_combine] == [r["_score"] for r in via_direct]
+    assert [r["_score"] for r in via_combine] != [r["_score"] for r in no_pct]
+
+
 # --------------------------------------------------------------------------
 # regress — 신규 순수 OLS (K-ratio용 기울기/표준오차)
 # --------------------------------------------------------------------------

@@ -94,6 +94,20 @@ def _filter_valid(rows: list[dict], criteria: list[dict], sectors=None, markets=
     return out
 
 
+def _winsorize_pct(vals: np.ndarray, pct: float | None) -> np.ndarray:
+    """원본값 배열을 [pct, 1-pct] 퍼센타일 경계에서 클리핑(winsorize)해 반환한다.
+
+    pct=None이면 원본을 그대로 돌려준다(회귀 없음). pct=0.01이면 하위 1%(1퍼센타일)/상위
+    1%(99퍼센타일) 지점 밖의 값을 그 경계로 눌러 붙인다 — z-score 계산 '전에' 원본값을 자르는
+    교과서적 winsorization 순서다. winsorize_z(z-score 자체를 시그마 배수로 자름)와 달리
+    분포 모양·표본 크기에 덜 민감하게 '매번 정확히 상하위 pct'를 자른다.
+    """
+    if pct is None:
+        return vals
+    lo, hi = np.percentile(vals, [pct * 100.0, (1.0 - pct) * 100.0])
+    return np.clip(vals, lo, hi)
+
+
 def select_stocks(
     rows: list[dict],
     criteria: list[dict],
@@ -102,6 +116,8 @@ def select_stocks(
     sectors=None,
     markets=None,
     sector_neutral: bool = False,
+    winsorize_z: float | None = None,
+    winsorize_pct: float | None = None,
 ) -> list[dict]:
     """선정된 종목 리스트(점수 우수순)를 반환. markets=['KOSPI','KOSDAQ'] 또는 None(전체).
 
@@ -112,6 +128,19 @@ def select_stocks(
     "섹터별 자체 랭킹"이 아니라 "섹터 내부 상대순위를 전체 비교 기준으로 삼는" 표준 sector-
     neutral 방식이다. raw 값이 큰 섹터로 결과가 쏠리던 문제(전기전자 몰림)를 없앤다.
     combine != "zscore"이거나 sector_neutral=False(기본값)면 기존 동작 그대로다(회귀 없음).
+
+    winsorize_z(zscore 조합일 때만 유효): 값이 주어지면 각 criterion의 z-score를
+    가중합하기 전에 [-winsorize_z, +winsorize_z]로 클리핑(잘라내기)한다 — 극단치 하나가
+    조합 점수를 지배하는 것을 막는 표준 z-score winsorization. None(기본값)이면 클리핑을
+    전혀 하지 않아 기존 동작과 100% 동일하다(회귀 없음). rank_sum/and 조합은 z-score를
+    쓰지 않으므로 이 파라미터의 영향을 받지 않는다.
+
+    winsorize_pct(zscore 조합일 때만 유효): winsorize_z와 별개 방식. 값이 주어지면 각
+    criterion의 z-score를 계산하기 '전에' 원본값을 [pct, 1-pct] 퍼센타일 경계로 클리핑한다
+    (예: 0.01 = 상하위 1%). "고정 시그마 배수(winsorize_z)"가 아니라 "매번 정확히 상하위
+    pct"를 자르므로 분포 모양·표본 크기에 덜 민감하다. None(기본값)이면 미적용(회귀 없음).
+    winsorize_z와 winsorize_pct는 독립적이며 둘 다 줄 수도 있다(원본값 퍼센타일 클리핑 →
+    표준화 → z-score 시그마 클리핑 순으로 적용).
     """
     valid = _filter_valid(rows, criteria, sectors, markets)
     if not valid or not criteria:
@@ -147,15 +176,21 @@ def select_stocks(
             # 0=best. high면 큰 값이 best.
             comp = np.argsort(np.argsort(-vals if high else vals)).astype(float)
         elif sector_neutral:  # 섹터별로 따로 평균/표준편차를 구한 z-score(섹터 내부 상대값)
-            z = np.zeros(len(vals), dtype=float)
+            wvals = _winsorize_pct(vals, winsorize_pct)  # z 계산 전 원본값 퍼센타일 클리핑(선택)
+            z = np.zeros(len(wvals), dtype=float)
             for idxs in sector_groups.values():
-                gvals = vals[idxs]
+                gvals = wvals[idxs]
                 mu, sd = gvals.mean(), (gvals.std() or 1.0)  # 1종목 섹터는 sd=0 → 1.0(z=0)
                 z[idxs] = (gvals - mu) / sd
+            if winsorize_z is not None:  # 극단치 완화: z를 [-w,+w]로 클리핑
+                z = np.clip(z, -winsorize_z, winsorize_z)
             comp = (-z if high else z)  # 낮을수록 우수
         else:  # zscore(전체 한 덩어리 — 기존 동작)
-            mu, sd = vals.mean(), (vals.std() or 1.0)
-            z = (vals - mu) / sd
+            wvals = _winsorize_pct(vals, winsorize_pct)  # z 계산 전 원본값 퍼센타일 클리핑(선택)
+            mu, sd = wvals.mean(), (wvals.std() or 1.0)
+            z = (wvals - mu) / sd
+            if winsorize_z is not None:  # 극단치 완화: z를 [-w,+w]로 클리핑
+                z = np.clip(z, -winsorize_z, winsorize_z)
             comp = (-z if high else z)  # 낮을수록 우수
         for r, cv in zip(valid, comp):
             scores[r["stock_code"]] += w * cv
