@@ -227,7 +227,9 @@ def test_api_query_rerun_screening_uses_override_spec(client, monkeypatch):
     assert r.json()["result"] == [{"stock_code": "005930"}]
 
 
-def test_api_query_rerun_screening_us_domain_routes_to_us_screening(client, monkeypatch):
+def test_api_query_rerun_screening_us_domain_is_disabled(client, monkeypatch):
+    """미국 도메인 재실행은 현재 비활성화 — 403으로 명확히 거부하고, us 스크리닝 함수는
+    호출조차 되지 않는다(관련 코드·데이터는 보존, 진입만 차단)."""
     captured: dict = {}
     monkeypatch.setattr(
         webapp, "answer_us_screening",
@@ -238,8 +240,9 @@ def test_api_query_rerun_screening_us_domain_routes_to_us_screening(client, monk
         "kind": "screening", "domain": "us", "question": "PER 낮은 3개",
         "spec": {"criteria": [{"key": "per", "direction": "low"}], "top_n": 3},
     })
-    assert r.status_code == 200
-    assert captured.get("called") is True
+    assert r.status_code == 403
+    assert "미국" in r.json()["detail"]
+    assert captured.get("called") is not True   # 비활성화 도메인은 실행되지 않는다
 
 
 def test_api_query_rerun_backtest_uses_edited_steps(client, monkeypatch):

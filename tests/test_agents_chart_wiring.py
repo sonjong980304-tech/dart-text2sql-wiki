@@ -741,18 +741,19 @@ def test_chart_fallback_receives_unwrapped_flat_list_for_single_domain():
 
 
 def test_chart_fallback_receives_per_domain_payloads_for_multi_domain():
-    """복합 도메인(kr+us): 각 도메인의 result만 뽑아 {도메인: payload} dict로 넘긴다
-    (도메인별 껍데기 dict가 아니라 그릴 데이터만)."""
+    """복합 도메인(kr+macro): 각 도메인의 result만 뽑아 {도메인: payload} dict로 넘긴다
+    (도메인별 껍데기 dict가 아니라 그릴 데이터만). 미국 도메인 비활성화와 무관하게 이
+    '도메인별 payload 추출' 로직은 도메인 종류를 가리지 않으므로 여전히 활성인 kr+macro로 검증한다."""
     from src.agents.supervisor import answer_with_verification
 
     kr_rows = [{"name": "삼성전자", "return_12m": 12.3}]
-    us_rows = [{"name": "AAPL", "return_12m": 30.0}]
+    macro_rows = [{"as_of": "2026-07-01", "overall": "GREEN"}]
 
     def stub_route(question, llm_fn):
-        return ["kr", "us"]
+        return ["kr", "macro"]
 
     def stub_dispatch(routes, question, conn, llm_fn, steps=None):
-        return {"kr": {"result": kr_rows}, "us": {"result": us_rows}}
+        return {"kr": {"result": kr_rows}, "macro": {"result": macro_rows}}
 
     captured = {}
 
@@ -761,13 +762,13 @@ def test_chart_fallback_receives_per_domain_payloads_for_multi_domain():
         return {"chart_base64": "PNG", "chart_title": "T"}
 
     res = answer_with_verification(
-        "한국·미국 상위 종목 수익률 그래프로 그려줘", conn=None, llm_fn="fake-llm",
+        "한국 상위 종목 수익률이랑 매크로 신호 그래프로 그려줘", conn=None, llm_fn="fake-llm",
         route_fn=stub_route, dispatch_fn=stub_dispatch, verify_fn=_valid_verify,
         chart_fallback_fn=fake_chart_fallback,
     )
     assert res["chart_base64"] == "PNG"
     # 도메인이 여러 개면 {도메인: 그 도메인의 result} — 껍데기 dict가 아니라 그릴 리스트만.
-    assert captured["data"] == {"kr": kr_rows, "us": us_rows}
+    assert captured["data"] == {"kr": kr_rows, "macro": macro_rows}
 
 
 def test_answer_with_verification_does_not_call_chart_fallback_when_build_charts_already_found():

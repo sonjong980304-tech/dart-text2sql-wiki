@@ -61,6 +61,14 @@ _DOMAINS: tuple[str, ...] = ("kr", "us", "macro", "backtest")
 # _DOMAIN_LABELS와 같은 매핑이지만, graph.py가 이 모듈을 import하므로 순환을 피해 로컬로 둔다).
 _DOMAIN_LABELS_KO: dict[str, str] = {"kr": "한국", "us": "미국", "macro": "매크로", "backtest": "백테스트"}
 
+# 미국 도메인 비활성화 사유(단일 출처) — web/app.py의 거부 응답과 자연어 라우팅 게이트가
+# 같은 문구를 쓴다. 미국 관련 코드·데이터(domain_us / data_access_us / us_* 테이블 등)는
+# 그대로 보존돼 있어 이 게이트만 풀면 다시 활성화할 수 있다(현재는 제품 진입만 차단).
+US_DISABLED_MESSAGE = (
+    "미국 도메인은 현재 비활성화되어 있습니다. 이 서비스는 현재 한국 주식만 지원합니다"
+    "(미국 관련 코드·데이터는 보존되어 있어 추후 다시 활성화할 수 있습니다)."
+)
+
 # llm_fn 미주입 시 사용하는 라우팅 휴리스틱. 도메인별 대표 키워드(부분일치).
 _ROUTE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "backtest": (
@@ -908,6 +916,25 @@ def answer_with_verification(
     progress_kwargs = {"on_progress": on_progress} if on_progress else {}
 
     routes = route_fn(question, llm_fn, **progress_kwargs)
+
+    # 미국 도메인은 현재 제품에서 비활성화 상태다(관련 코드·데이터는 보존 — 추후 재활성화 가능).
+    # 라우팅이 us를 잡아도 실제로 실행(dispatch)하지 않도록 여기서 걸러낸다. 미국만 필요한
+    # 질문이면 dispatch/verify를 시도하는 낭비 없이 즉시 '비활성화' 사유로 우아하게 끝낸다
+    # (크래시 없음). 복합 도메인(kr+us 등)이면 us만 빼고 나머지로 정상 진행한다. route_question/
+    # dispatch_domains 자체는 손대지 않아 미국 라우팅·조회 능력은 그대로 보존된다(정책만 여기서 차단).
+    if "us" in routes:
+        routes = [r for r in routes if r != "us"]
+        if not routes:
+            if on_progress:
+                on_progress("supervisor", US_DISABLED_MESSAGE)
+            return {
+                "uncertain": True,
+                "reason": US_DISABLED_MESSAGE,
+                "attempts": 0,
+                "domain_results": {},
+                "routes": [],
+            }
+
     if not routes:
         # 라우팅이 도메인을 하나도 못 찾음(unknown) — dispatch/verify를 시도하는 낭비 없이
         # 즉시 불확실 응답으로 끝낸다(완전히 무관한 질문에 억지로 도메인을 갖다붙이지 않는다).

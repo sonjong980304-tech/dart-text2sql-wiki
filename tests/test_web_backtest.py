@@ -226,24 +226,20 @@ def _patch_us(monkeypatch):
     monkeypatch.setattr(bt_engine, "save_backtest_run", lambda *a, **k: None)
 
 
-def test_domain_us_uses_us_pipeline_and_names(monkeypatch):
-    """domain='us'면 US 콜백+us_company 종목명 매핑을 쓰고 KR 경로를 타지 않는다."""
-    _patch_us(monkeypatch)
-
-    def fake_run_backtest(dates, mfn, pfn, params, benchmark_fn=None):
-        return {"dates": ["2024-01-31"], "navs": [1.0], "benchmark": None,
-                "performance": {}, "holdings": [{"date": "2024-01-31", "codes": ["AAPL"]}]}
-
-    monkeypatch.setattr(bt_engine, "run_backtest", fake_run_backtest)
+def test_domain_us_backtest_is_disabled(monkeypatch):
+    """domain='us' 백테스트는 현재 비활성화 — 403으로 거부하고 US/KR 파이프라인 콜백은
+    어느 것도 호출되지 않는다(미국 관련 코드·데이터는 보존, 진입만 차단)."""
+    monkeypatch.setattr(bt_da_us, "build_callbacks_us", _us_forbidden)
+    monkeypatch.setattr(bt_da_us, "build_sp500_benchmark_fn", _us_forbidden)
+    monkeypatch.setattr(bt_da, "build_callbacks", _kr_forbidden)
     client = TestClient(webapp.app)
 
     r = client.post("/api/backtest", json={
         "domain": "us", "markets": ["NASDAQ"],
         "criteria": [{"key": "per", "direction": "low", "weight": 1}]})
 
-    assert r.status_code == 200, r.text
-    # 종목명이 us_company에서 매핑돼 나온다(KR company 조회는 _FakeConnUS가 막음).
-    assert r.json()["holdings"] == [{"date": "2024-01-31", "names": ["Apple Inc."]}]
+    assert r.status_code == 403, r.text
+    assert "미국" in r.json()["detail"]
 
 
 def test_domain_default_preserves_kr_pipeline(monkeypatch):
@@ -280,17 +276,19 @@ def test_invalid_domain_returns_400(monkeypatch):
     assert "domain" in r.json()["detail"]
 
 
-def test_domain_us_rejects_kr_market(monkeypatch):
-    """domain='us'에서 KR 시장값(KOSPI)을 보내면 400(허용값은 NASDAQ/NYSE/NYSE Amex)."""
-    _patch_us(monkeypatch)
+def test_domain_us_disable_gate_precedes_market_validation(monkeypatch):
+    """미국 비활성화 게이트가 시장값 검증보다 먼저 걸린다 — us+KOSPI(원래는 시장 오류 400)라도
+    도메인 자체가 막혀 403이 먼저 반환된다(순서: 도메인 비활성화 > 시장 검증)."""
+    monkeypatch.setattr(bt_da_us, "build_callbacks_us", _us_forbidden)
+    monkeypatch.setattr(bt_da, "build_callbacks", _kr_forbidden)
     client = TestClient(webapp.app)
 
     r = client.post("/api/backtest", json={
         "domain": "us", "markets": ["KOSPI"],
         "criteria": [{"key": "per", "direction": "low", "weight": 1}]})
 
-    assert r.status_code == 400, r.text
-    assert "시장" in r.json()["detail"]
+    assert r.status_code == 403, r.text
+    assert "미국" in r.json()["detail"]
 
 
 def test_domain_kr_rejects_us_market(monkeypatch):
@@ -323,14 +321,19 @@ class _SectorConn:
         self.closed = True
 
 
-def test_sectors_domain_us_queries_us_company(monkeypatch):
-    monkeypatch.setattr(webapp, "connect", lambda *a, **k: _SectorConn())
+def test_sectors_domain_us_is_disabled(monkeypatch):
+    """GET /api/sectors?domain=us 는 비활성화 — 403으로 거부하고 DB 조회(connect)조차 하지
+    않는다(us_company 섹터 조회 코드는 보존, 진입만 차단)."""
+    def _forbid_connect(*a, **k):
+        raise AssertionError("미국 도메인은 비활성화 — DB 연결이 열리면 안 된다")
+
+    monkeypatch.setattr(webapp, "connect", _forbid_connect)
     client = TestClient(webapp.app)
 
     r = client.get("/api/sectors?domain=us")
 
-    assert r.status_code == 200, r.text
-    assert r.json() == ["Healthcare", "Technology"]
+    assert r.status_code == 403, r.text
+    assert "미국" in r.json()["detail"]
 
 
 def test_sectors_domain_default_queries_kr_company(monkeypatch):

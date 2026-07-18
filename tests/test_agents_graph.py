@@ -239,16 +239,17 @@ def test_event_summary_reports_uncertain_on_failure(monkeypatch):
 # ── .stream() 통합 — 노드 완료 이벤트가 순서대로 방출됨(mock LLM 주입) ─────────
 
 def test_run_streaming_emits_supervisor_event(monkeypatch):
-    """HA-12 확장: 라우팅→도메인별(kr/us)→검증 단계별로 여러 이벤트가 실시간 순서대로
-    방출된다(기존 "노드 완료 후 요약 1줄"에서 "진행 중 여러 번 통지"로 바뀜)."""
+    """HA-12 확장: 라우팅→도메인별→검증 단계별로 여러 이벤트가 실시간 순서대로 방출된다.
+    미국 도메인은 현재 비활성화되어(관련 코드는 보존) dispatch되지 않으므로, 질문이 kr+us로
+    라우팅돼도 실제 실행 단계에는 kr만 나타난다."""
     _seed_valid_domains(monkeypatch)
     events = list(run_streaming("삼성전자 vs 애플 비교", conn=None, llm_fn=_multi_domain_fake_llm))
 
     steps_order = [e["step"] for e in events]
-    assert len(events) >= 4                     # 라우팅1 + 도메인(kr,us) 시작/완료 4건 이상
+    assert len(events) >= 4                     # 라우팅1 + kr 시작/완료 + 검증 4건 이상
     assert steps_order[0] == "supervisor"        # 라우팅이 가장 먼저
-    assert "한국" in events[0]["summary"] and "미국" in events[0]["summary"]
-    assert "kr" in steps_order and "us" in steps_order
+    assert "한국" in events[0]["summary"]
+    assert "kr" in steps_order and "us" not in steps_order  # 미국은 비활성화 → 실행되지 않음
     assert steps_order[-1] == "verify"           # 검증 결과가 마지막
     assert "통과" in events[-1]["summary"]
 
@@ -316,7 +317,7 @@ def test_run_streaming_populates_out_final_with_final_state(monkeypatch):
 
     assert events  # 진행 이벤트는 그대로 방출된다(기존 동작 불변)
     assert out_final.get("conclusion") == "삼성전자와 애플 종합 결론"
-    assert out_final.get("routes") == ["kr", "us"]
+    assert out_final.get("routes") == ["kr"]   # 미국은 비활성화되어 제외됨(코드는 보존)
     assert out_final.get("uncertain") is False
 
 

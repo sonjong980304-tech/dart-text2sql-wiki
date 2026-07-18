@@ -1009,23 +1009,25 @@ def test_answer_with_verification_verify_and_synthesize_use_original_question():
 #    이미 통과한 도메인 결과는 유지한다(전체 재실행 낭비 방지) ───────────────────────
 
 def test_answer_with_verification_retries_only_failed_domain_in_composite_question():
+    # '실패한 도메인만 부분 재시도'하는 총괄 메커니즘은 도메인 종류와 무관하다. 미국 도메인이
+    # 비활성화된 뒤에도 이 메커니즘은 그대로이므로, 여전히 활성인 kr+macro 복합으로 검증한다.
     dispatch_routes_seen: list[list[str]] = []
 
     def stub_route(question, llm_fn):
-        return ["kr", "us"]
+        return ["kr", "macro"]
 
     def stub_dispatch(routes, question, conn, llm_fn, steps=None):
         dispatch_routes_seen.append(list(routes))
         result = {}
         if "kr" in routes:
             result["kr"] = {"stock_code": "005930", "financial": {"value": 12.5}}
-        if "us" in routes:
-            result["us"] = {"stock_code": "NVDA", "financial": {"value": 30.0}}
+        if "macro" in routes:
+            result["macro"] = {"available": True, "overall": "GREEN"}
         return result
 
     per_domain_by_attempt = iter([
-        {"kr": {"valid": True, "reason": "일치"}, "us": {"valid": False, "reason": "US 불일치"}},
-        {"us": {"valid": True, "reason": "이제 일치"}},
+        {"kr": {"valid": True, "reason": "일치"}, "macro": {"valid": False, "reason": "매크로 불일치"}},
+        {"macro": {"valid": True, "reason": "이제 일치"}},
     ])
 
     def stub_verify(question, domain_results, llm_fn):
@@ -1038,16 +1040,16 @@ def test_answer_with_verification_retries_only_failed_domain_in_composite_questi
         }
 
     res = answer_with_verification(
-        "삼성전자랑 엔비디아 PER 비교", conn=None, llm_fn=None,
+        "삼성전자 PER이랑 매크로 신호 비교", conn=None, llm_fn=None,
         route_fn=stub_route, dispatch_fn=stub_dispatch, verify_fn=stub_verify,
     )
 
-    assert dispatch_routes_seen[0] == ["kr", "us"]  # 1차는 전체 라우트
-    assert dispatch_routes_seen[1] == ["us"]  # 2차는 실패했던 us만
+    assert dispatch_routes_seen[0] == ["kr", "macro"]  # 1차는 전체 라우트
+    assert dispatch_routes_seen[1] == ["macro"]  # 2차는 실패했던 macro만
     assert res["uncertain"] is False
     assert res["attempts"] == 2
     assert res["domain_results"]["kr"]["stock_code"] == "005930"  # kr은 1차 결과 그대로 유지
-    assert res["domain_results"]["us"]["stock_code"] == "NVDA"
+    assert res["domain_results"]["macro"]["overall"] == "GREEN"
 
 
 def test_answer_with_verification_returns_uncertain_immediately_when_routes_empty():
@@ -1070,6 +1072,55 @@ def test_answer_with_verification_returns_uncertain_immediately_when_routes_empt
     assert res["uncertain"] is True
     assert res["routes"] == []
     assert res["attempts"] == 0
+
+
+# ── 미국 도메인 비활성화 게이트 — 라우팅이 us를 잡아도 실행하지 않고 우아하게 거부한다.
+#    (미국 관련 코드·데이터는 보존되어 있으나 현재 제품에서는 진입을 막는다.) ────────────
+def test_answer_with_verification_us_only_question_returns_disabled_without_dispatch():
+    """미국만 필요한 질문은 dispatch/verify를 시도조차 하지 않고 즉시 '비활성화' 사유로
+    끝난다(크래시 없음). route_fn이 us만 반환해도 마찬가지다."""
+    dispatch_calls: list[int] = []
+
+    def stub_route(question, llm_fn):
+        return ["us"]
+
+    def stub_dispatch(routes, question, conn, llm_fn, steps=None):
+        dispatch_calls.append(1)
+        return {}
+
+    res = answer_with_verification(
+        "애플 PER 알려줘", conn=None, llm_fn=None,
+        route_fn=stub_route, dispatch_fn=stub_dispatch,
+    )
+    assert dispatch_calls == []          # us 도메인은 dispatch 자체를 하지 않는다
+    assert res["uncertain"] is True
+    assert res["routes"] == []
+    assert res["attempts"] == 0
+    assert "미국" in res["reason"]       # 명확한 비활성화 사유
+
+
+def test_answer_with_verification_drops_us_from_mixed_domains_and_proceeds():
+    """복합 도메인(kr+us)에서는 us만 제외하고 나머지(kr)로 정상 진행한다 — 크래시 없이."""
+    dispatch_routes_seen: list[list[str]] = []
+
+    def stub_route(question, llm_fn):
+        return ["kr", "us"]
+
+    def stub_dispatch(routes, question, conn, llm_fn, steps=None):
+        dispatch_routes_seen.append(list(routes))
+        return {"kr": {"stock_code": "005930", "financial": {"value": 12.5}}}
+
+    def valid_verify(question, domain_results, llm_fn):
+        return {"valid": True, "reason": "일치"}
+
+    res = answer_with_verification(
+        "삼성전자 vs 애플 PER 비교", conn=None, llm_fn=None,
+        route_fn=stub_route, dispatch_fn=stub_dispatch, verify_fn=valid_verify,
+    )
+    assert dispatch_routes_seen[0] == ["kr"]   # us는 빠지고 kr만 dispatch
+    assert res["routes"] == ["kr"]
+    assert res["uncertain"] is False
+    assert "us" not in res["domain_results"]
 
 
 def test_answer_with_verification_without_on_progress_is_unaffected():

@@ -45,6 +45,7 @@ from src.agents.domain_backtest import answer_backtest_question
 from src.agents.domain_kr import answer_kr_screening
 from src.agents.domain_us import answer_us_screening
 from src.agents.graph import run_hierarchical, run_streaming
+from src.agents.supervisor import US_DISABLED_MESSAGE
 from src.config import CONFIG
 from src.db import connect, connect_readonly
 from src.ingest.exchange_rate import fetch_usdkrw_rate_live
@@ -55,6 +56,15 @@ app = FastAPI(title="Quant Assistant")
 STATIC_DIR = Path(__file__).parent / "static"
 
 # sqlite conn은 스레드 귀속이므로 요청마다 새 읽기전용 연결을 연다(계층형 그래프가 소비).
+
+
+def _reject_if_us_domain(domain: Optional[str]) -> None:
+    """domain이 'us'면 명확한 사유로 요청을 거부한다(403). 미국 도메인은 현재 제품에서
+    비활성화 상태 — 관련 코드·데이터(us_* 테이블, data_access_us 등)는 그대로 보존돼 있어
+    이 게이트만 풀면 다시 활성화할 수 있다. 각 도메인 스위칭 엔드포인트(재실행/섹터/백테스트)
+    맨 앞에서 호출해 중복 없이 한 곳에서 정책을 강제한다."""
+    if (domain or "").strip().lower() == "us":
+        raise HTTPException(403, US_DISABLED_MESSAGE)
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +193,7 @@ def api_query_rerun(req: RerunReq):
     if not req.question.strip():
         raise HTTPException(400, "질문이 비어 있습니다.")
     if req.kind == "screening":
+        _reject_if_us_domain(req.domain)  # 미국 도메인 비활성화(코드는 보존, 진입만 차단)
         if req.domain not in ("kr", "us"):
             raise HTTPException(400, "domain은 'kr' 또는 'us'여야 합니다.")
         if not isinstance(req.spec, dict):
@@ -708,6 +719,7 @@ def api_metric_defs():
 @app.get("/api/sectors")
 def api_sectors(domain: str = "kr"):
     # kr: company(KRX 업종분류) / us: us_company(원본 taxonomy). 그 외 값은 사용자 입력 오류(400).
+    _reject_if_us_domain(domain)  # 미국 도메인 비활성화(코드는 보존, 진입만 차단)
     if domain not in ("kr", "us"):
         raise HTTPException(400, "domain은 'kr' 또는 'us'여야 합니다.")
     table = "company" if domain == "kr" else "us_company"
@@ -726,6 +738,7 @@ def api_backtest(req: BacktestReq):
 
     # domain(kr|us): KR(KOSPI/KOSDAQ)와 US(NASDAQ/NYSE/NYSE Amex)는 통화·데이터소스가 달라
     # 한 백테스트에서 섞지 않는다(프런트도 배타적 토글). 기본 'kr'로 기존 동작 100% 보존.
+    _reject_if_us_domain(req.domain)  # 미국 도메인 비활성화(코드는 보존, 진입만 차단)
     if req.domain not in ("kr", "us"):
         raise HTTPException(400, "domain은 'kr' 또는 'us'여야 합니다.")
     if not req.criteria:
