@@ -160,6 +160,43 @@ def _match_company_candidates(conn, text: str, execute_sql_fn: Callable) -> list
     ]
 
 
+def _former_name_match_sql(escaped_text: str) -> str:
+    """예전 사명(kr_stock_changes.name_before/name_after)이 질문에 포함되는 종목을 뽑는 SQL.
+
+    회사가 사명을 바꾸면 예전 이름은 company.name(현재 사명)에 없어 매칭에 실패한다 — 이 이력
+    테이블에서 변경전/후 이름을 모두 후보로 삼는다(중간 사명은 한 행의 변경후이자 다음 행의
+    변경전이라, 양쪽을 모두 매칭하면 사명 변경 체인의 모든 과거 이름을 커버한다). 매칭 방식은
+    현재 사명 매칭(_name_match_sql)과 동일한 역방향 LIKE(질문이 예전 이름을 통째로 포함하는가)이며,
+    가장 구체적인 매치(가장 긴 예전 이름)를 우선한다. execute_sql(읽기전용) 경유로만 실행한다.
+    """
+    return (
+        "SELECT stock_code, matched_text FROM (\n"
+        "  SELECT stock_code, name_before AS matched_text FROM kr_stock_changes\n"
+        f"    WHERE name_before IS NOT NULL AND name_before != '' "
+        f"AND '{escaped_text}' LIKE '%' || name_before || '%'\n"
+        "  UNION\n"
+        "  SELECT stock_code, name_after AS matched_text FROM kr_stock_changes\n"
+        f"    WHERE name_after IS NOT NULL AND name_after != '' "
+        f"AND '{escaped_text}' LIKE '%' || name_after || '%'\n"
+        ") ORDER BY LENGTH(matched_text) DESC"
+    )
+
+
+def _match_former_name_candidates(conn, text: str, execute_sql_fn: Callable) -> list[dict]:
+    """예전 사명 매칭 후보를 우선순위(가장 긴 예전 이름 먼저) 정렬 리스트로 반환한다.
+
+    각 항목은 {stock_code, matched_text}. kr_stock_changes 테이블이 없거나(구 DB) 조회 실패면
+    빈 리스트를 돌려 현재 사명 매칭만으로도 안전하게 동작한다(폴백이 크래시를 유발하지 않음).
+    """
+    result = execute_sql_fn(_former_name_match_sql(_escape_sql_literal(text)), conn)
+    if not result.get("ok"):
+        return []
+    return [
+        {"stock_code": r["stock_code"], "matched_text": r["matched_text"]}
+        for r in result["rows"]
+    ]
+
+
 def find_stock_code(
     conn,
     question: str,
@@ -172,7 +209,10 @@ def find_stock_code(
        질문이 회사 공식명을 통째로 포함하거나(역방향 LIKE), 그룹·지주 접두어(SK/LG/…)를
        뗀 나머지가 질문에 포함되는(실재 회사) 경우를 모두 후보로 삼아, 가장 구체적인
        매치를 우선한다("하이닉스"→SK하이닉스, 무관한 짧은 이름 "이닉스" 오탐 억제).
-    3) SQL은 execute_sql(HA-1 실행기)로만 실행한다(conn.execute() 직접 호출 금지).
+    3) 현재 사명(company)으로 못 찾으면 예전 사명(kr_stock_changes.name_before/name_after)으로
+       폴백한다 — 회사가 이름을 바꾸면 옛 이름은 company 에 없어 매칭에 실패하므로, 사명 변경
+       이력에서 과거 이름으로도 종목코드를 찾는다("옛이름전자"→현재 종목코드).
+    4) SQL은 execute_sql(HA-1 실행기)로만 실행한다(conn.execute() 직접 호출 금지).
 
     매치가 없으면 None을 반환한다.
     """
@@ -184,9 +224,11 @@ def find_stock_code(
     if not text.strip():
         return None
     matches = _match_company_candidates(conn, text, execute_sql_fn)
-    if not matches:
-        return None
-    return matches[0]["stock_code"]
+    if matches:
+        return matches[0]["stock_code"]
+    # 현재 사명으로 못 찾으면 예전 사명(사명 변경 이력)으로 폴백한다.
+    former = _match_former_name_candidates(conn, text, execute_sql_fn)
+    return former[0]["stock_code"] if former else None
 
 
 def find_stock_codes(
@@ -217,7 +259,14 @@ def find_stock_codes(
 
     if text.strip():
         accepted_texts: list[str] = []
-        for cand in _match_company_candidates(conn, text, execute_sql_fn):
+        # 현재 사명 매칭 + 예전 사명(사명 변경 이력) 폴백을 이어 순회한다. 현재 사명을 먼저
+        # 처리해 겹치는(부분문자열) 예전 이름은 자동으로 걸러진다(find_stock_code 단수와 동일한
+        # 폴백 규칙을 복수 경로로 확장 — 옛 이름으로 지목된 종목도 누락되지 않게).
+        candidates = (
+            _match_company_candidates(conn, text, execute_sql_fn)
+            + _match_former_name_candidates(conn, text, execute_sql_fn)
+        )
+        for cand in candidates:
             matched_text = cand["matched_text"]
             if any(matched_text in accepted for accepted in accepted_texts):
                 continue

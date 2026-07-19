@@ -305,6 +305,32 @@ CREATE TABLE IF NOT EXISTS kr_trading_status (
     UNIQUE(stock_code, status_type, start_date)
 );
 
+-- KR 기업 주요 변동이력 (상호/업종/액면 변경). pykrx get_stock_major_changes(ticker) 가 종목별로
+-- 날짜별 상호변경전/후·업종변경전/후·액면변경전/후·대표이사변경전/후를 돌려준다(1975년부터의
+-- 전체 이력을 시점조회 없이 한 번에 반환 — kr_trading_status 의 '오늘 스냅샷만' 제약과 달리 과거
+-- 이력이 통째로 온다). 이 중 스크리닝/백테스트/회사명 매칭에 쓰는 상호·업종·액면만 저장하고
+-- 대표이사변경은 저장하지 않는다(YAGNI). 핵심 활용: 자연어→SQL 질의에서 회사명 매칭이 현재
+-- 사명(company.name)으로 실패할 때 예전 사명(name_before/name_after)으로도 종목코드를 찾는다
+-- (domain_kr.find_stock_code 폴백). 액면변경(분할/병합)은 향후 수동 분할보정 도구가 "언제 분할이
+-- 있었나" 참고자료로 쓸 수 있어 저장만 해둔다(이번 스코프에서 그 도구엔 연결하지 않음).
+-- '없음' 표기는 pykrx 원본이 텍스트 "-"/액면 0 이며, 적재 시 모두 NULL 로 정규화한다. 한 종목이
+-- 여러 번 변경하면 (종목,날짜)별로 여러 행을 가진다 → UNIQUE(stock_code, changed_at) 로 재수집
+-- 멱등(INSERT OR REPLACE 로 값 정정도 반영). 자연어 SQL 질의 대상 아님(QUERYABLE_TABLES 미포함 —
+-- 회사명 매칭 폴백 전용으로 domain_kr 이 execute_sql 경유로만 읽는다).
+CREATE TABLE IF NOT EXISTS kr_stock_changes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_code    TEXT NOT NULL,   -- 종목코드 (6자리 단축코드)
+    changed_at    TEXT NOT NULL,   -- 변경일 (YYYY-MM-DD, pykrx 날짜 인덱스)
+    name_before   TEXT,            -- 상호변경전 (없으면 NULL)
+    name_after    TEXT,            -- 상호변경후 (없으면 NULL)
+    sector_before TEXT,            -- 업종변경전 (없으면 NULL)
+    sector_after  TEXT,            -- 업종변경후 (없으면 NULL)
+    par_before    INTEGER,         -- 액면변경전 (원, 없으면 NULL — pykrx 0 을 NULL 로)
+    par_after     INTEGER,         -- 액면변경후 (원, 없으면 NULL)
+    updated_at    TEXT,            -- 마지막 수집 시각 (ISO)
+    UNIQUE(stock_code, changed_at)
+);
+
 -- 지표 정의 (백테스트 UI 자동생성용)
 CREATE TABLE IF NOT EXISTS metric_def (
     key         TEXT PRIMARY KEY,      -- metrics 컬럼명
@@ -359,6 +385,7 @@ CREATE INDEX IF NOT EXISTS idx_price_code_d ON prices(stock_code, date);
 CREATE INDEX IF NOT EXISTS idx_price_date   ON prices(date);
 CREATE INDEX IF NOT EXISTS idx_metrics_code ON metrics(stock_code, quarter);
 CREATE INDEX IF NOT EXISTS idx_metrics_full ON metrics(stock_code, quarter, price_date);
+CREATE INDEX IF NOT EXISTS idx_kr_stock_changes_code ON kr_stock_changes(stock_code);
 
 -- 원본 재무제표 응답 보관 (재수집 없이 재파싱용). payload = zlib.compress(json.dumps(list)).
 -- 새 계정이 필요해지면 재수집 대신 이 원본을 재파싱해 financials를 다시 만든다.
