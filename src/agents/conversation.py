@@ -33,7 +33,7 @@ import pandas as pd
 from src.agents.chart_agent import build_chart_freeform
 from src.agents.exec_fallback import _extract_python_code, _is_meaningfully_empty
 from src.agents.exec_runtime import execute_python
-from src.agents.supervisor import answer_with_verification, wants_chart
+from src.agents.supervisor import _chartable_payload, answer_with_verification, wants_chart
 
 
 @dataclass
@@ -173,7 +173,15 @@ def _run_followup_step(
 
     execute_python_fn = execute_python_fn or execute_python
     chart_fn = chart_fn or build_chart_freeform
-    summary = _summarize_data_shape(prior_data)
+    # prior_data는 _run_new_turn이 남긴 domain_results 원본({"backtest":{"result":{...}}}
+    # 같은 도메인 래퍼)일 수 있다 — 그대로 넘기면 LLM이 실제 값이 어디 묻혀있는지
+    # (data['backtest']['result']['x'])를 못 찾아 코드가 실패한다(실사용 재현: "PBR
+    # 오름차순 그래프" 다음 "막대그래프로 그려줘"가 매번 실패로 끝났음). supervisor.py의
+    # _chartable_payload가 이미 차트 생성 단계에서 이 문제를 푸는 데 쓰이던 헬퍼라
+    # 그대로 재사용한다(새 로직 발명 없음) — 도메인이 하나면 그 result만, 이미 평범한
+    # 리스트/dict(예: 직전 이어가기 결과)면 그대로 통과시킨다(회귀 없음).
+    payload = _chartable_payload(prior_data)
+    summary = _summarize_data_shape(payload)
     code: str | None = None
     code_error: str | None = None
     for attempt in range(max_code_attempts):
@@ -189,7 +197,7 @@ def _run_followup_step(
 
         if on_progress:
             on_progress("생성된 코드 실행 중")
-        py_result = execute_python_fn(code, context={"data": prior_data}, result_var="result")
+        py_result = execute_python_fn(code, context={"data": payload}, result_var="result")
         if not py_result.get("ok"):
             code_error = f"Python 실행 실패: {py_result.get('error')}"
             if on_progress:
@@ -207,7 +215,7 @@ def _run_followup_step(
         if wants_chart(question):
             if on_progress:
                 on_progress("차트 생성 중")
-            chart = chart_fn(question, prior_data, chart_llm_fn or llm_fn, execute_python_fn=execute_python_fn)
+            chart = chart_fn(question, payload, chart_llm_fn or llm_fn, execute_python_fn=execute_python_fn)
 
         if on_progress:
             on_progress("완료")

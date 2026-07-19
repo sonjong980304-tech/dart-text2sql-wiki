@@ -251,6 +251,41 @@ def test_followup_execution_context_receives_full_prior_data():
     assert captured_contexts[0]["data"] == [{"code": "005930", "pbr": 1.2}, {"code": "000660", "pbr": 0.9}]
 
 
+def test_followup_execution_context_unwraps_domain_wrapped_prior_data():
+    """이전 턴이 신규조회(_run_new_turn)로 끝나 session.current_data가 domain_results
+    원본({"backtest": {"result": {...}}} 같은 도메인 래퍼)으로 저장된 경우, 이어가기 Python
+    코드 실행 컨텍스트에는 래퍼를 벗긴 실제 데이터가 들어가야 한다 — 안 벗기면 LLM이 생성한
+    코드가 data['x'] 같은 자연스러운 접근을 못 찾아 실패한다(실사용 재현: "코스피 전체 종목
+    pbr 오름차순 그래프" 다음 "막대그래프로 그려줘"가 이어가기 실패 → 신규조회 폴백까지
+    실패로 끝났음 — backtest 도메인의 scatter_data 결과가 {"backtest":{"result":{"x":...,
+    "y":...}}} 형태로 저장되면서 발생)."""
+    session = _fresh_session()
+    session.has_data = True
+    session.current_data = {
+        "backtest": {"blocked": False, "error": None, "result": {
+            "x": [0.8, 0.6], "y": [3e14, 2e14], "labels": ["A", "B"],
+            "x_field": "pbr", "y_field": "market_cap",
+        }},
+    }
+
+    captured_contexts = []
+
+    def fake_llm(prompt):
+        return "```python\nresult = data['x']\n```"
+
+    def fake_execute_python(code, context, result_var, extra_vars=None):
+        captured_contexts.append(context)
+        return {"ok": True, "result": context["data"]["x"]}
+
+    run_turn(session, "막대그래프로 그려줘", conn=None, llm_fn=fake_llm,
+              execute_python_fn=fake_execute_python, classify_fn=lambda *a, **k: False)
+
+    assert captured_contexts[0]["data"] == {
+        "x": [0.8, 0.6], "y": [3e14, 2e14], "labels": ["A", "B"],
+        "x_field": "pbr", "y_field": "market_cap",
+    }
+
+
 # --------------------------------------------------------------------------
 # 무관한 새 주제 자동 감지 — 세션에 데이터가 있어도 새 질문이 그 데이터와 무관하면
 # 이어가기 대신 신규 조회(_run_new_turn)로 처리한다(실사용 재현: "삼성전자 오늘 종가" 다음
