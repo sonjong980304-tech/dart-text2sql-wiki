@@ -169,6 +169,15 @@ def _execute_steps(steps: list[dict], conn, ops: dict, max_size: int):
         merged = {name: state[name] for name in leaves}
         _check_size([merged], max_size)
         return merged
+    if len(leaves) == 1:
+        # leaf가 정확히 1개면 그 값이 최종 결과다 — 마지막으로 "실행된" 스텝이 아니라
+        # 마지막으로 "이름 붙여진(out)" leaf 스텝의 값을 돌려준다. 실서버 재현 버그: leaf
+        # 스텝(예: run_backtest out="bt") 뒤에 out이 없는 트레일링 스텝이 하나라도 더 있으면
+        # (LLM이 "이게 최종 답이니 이름이 필요없다"고 오판해 out을 생략하는 경우), 이전
+        # 코드는 그 트레일링 스텝의 반환값(result 변수, 매 반복마다 덮어써짐)을 그대로
+        # 돌려줘 진짜 leaf(holdings 등)가 사라지고 모양이 다른 값이 대신 나갔다 — auditor의
+        # 하드체크가 조용히 스킵되거나 예상치 못한 모양을 받아 크래시할 수 있었다.
+        return state[leaves[0]]
     return result
 
 

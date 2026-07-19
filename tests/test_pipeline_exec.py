@@ -238,6 +238,27 @@ def test_run_pipeline_single_leaf_still_returns_bare_value_not_dict():
     assert run_pipeline(steps, ops=ops) == 12  # dict가 아니라 스칼라 그대로(회귀 없음)
 
 
+def test_run_pipeline_single_leaf_survives_trailing_unnamed_step():
+    """실서버 재현 버그: leaf(예: run_backtest의 out="bt")가 파이프라인 중간에 있고, 그
+    뒤에 "out"이 없는 트레일링 스텝이 이어지면(LLM이 "이게 최종 답이니 이름 필요없다"고
+    오판해 마지막 스텝에 out을 안 붙이는 경우), _execute_steps가 실제 leaf(state[leaf])가
+    아니라 '마지막으로 실행된 스텝의 반환값'을 그대로 돌려주는 버그가 있었다 —
+    run_backtest의 holdings가 사라지고 트레일링 스텝의 엉뚱한 결과가 그 자리를 대신해,
+    auditor.post_audit이 그 엉뚱한 값(모양이 다른 dict)을 받아 하드체크가 조용히
+    스킵되거나 예상치 못한 모양으로 크래시할 수 있었다. leaf가 1개면 outs_in_order 상
+    위치와 무관하게 그 leaf 값이 최종 결과여야 한다."""
+    ops = {
+        "leaf_op": lambda: {"holdings": [{"date": "d1", "codes": ["005930"]}]},
+        "unrelated_op": lambda rows: {"correlation": 0.5},
+    }
+    steps = [
+        {"op": "leaf_op", "params": {}, "out": "bt"},
+        {"op": "unrelated_op", "params": {"rows": [1, 2, 3]}},  # out 없음 — 트레일링 스텝
+    ]
+    res = run_pipeline(steps, ops=ops)
+    assert res == {"holdings": [{"date": "d1", "codes": ["005930"]}]}
+
+
 def test_run_pipeline_correlation_and_quantile_bucket_means_both_survive():
     """실서버 재현 버그의 실제 패턴: 같은 rows에서 correlation과 quantile_bucket_means를
     각각 별도 out으로 뽑는 파이프라인 — 예전엔 quantile_bucket_means(마지막 단계)만 남고

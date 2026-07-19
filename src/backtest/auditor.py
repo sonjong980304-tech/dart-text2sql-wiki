@@ -54,6 +54,13 @@ def check_survivorship(conn, holdings: list[dict], is_alive_fn: Callable | None 
         is_alive_fn = _is_alive
     evidence = []
     for h in holdings or []:
+        if not isinstance(h, dict):
+            # 파이프라인 조립 오류로 모양이 깨진 원소는 생존여부를 감사할 방법이 없다.
+            # 조용히 건너뛰면 holdings 전체가 이 모양일 때 "검사 0건 → 이상 없음"이 되어
+            # 하드차단의 존재 의미(감사 불가 = 안전하게 차단)를 정면으로 뒤집는다 —
+            # 감사 불가 자체를 증거로 남겨 fail-closed를 유지한다.
+            evidence.append({"malformed_holding": repr(h)[:200], "asof": None})
+            continue
         asof = h.get("date")
         for code in h.get("codes", []) or []:
             if not is_alive_fn(conn, code, asof):
@@ -80,6 +87,10 @@ def check_lookahead(conn, holdings: list[dict], quarter_fn: Callable | None = No
     quarter_fn = quarter_fn or effective_quarter_at
     evidence = []
     for h in holdings or []:
+        if not isinstance(h, dict):
+            # check_survivorship과 동일한 이유(fail-closed 유지) — 감사 불가 자체를 증거로.
+            evidence.append({"malformed_holding": repr(h)[:200], "asof": None})
+            continue
         asof = h.get("date")
         for code in h.get("codes", []) or []:
             q = quarter_fn(conn, code, asof)

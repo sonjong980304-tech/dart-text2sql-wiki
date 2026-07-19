@@ -67,6 +67,38 @@ def test_check_survivorship_passes_when_all_alive(tmp_path):
     assert v["evidence"] == []
 
 
+def test_check_survivorship_blocks_when_holdings_entry_is_malformed(tmp_path):
+    """실서버 재현 버그: 파이프라인 조립 오류로 holdings 원소가 dict가 아니라 list로
+    들어오면([["005930"], ["000660"]]처럼) h.get("date")에서 AttributeError('list' object
+    has no attribute 'get')로 죽었다 — backtest_verification.py의 fail-closed try/except가
+    이를 잡아 "내부 오류로 차단"이라는 불친절한 메시지로만 막아줬다.
+
+    architect 검토 REJECT 근거: 이 원소를 조용히 건너뛰기만 하면(구 방어코드), holdings
+    전체가 이 모양일 때 "검사 0건 → blocked=False(정상 통과)"가 되어 하드차단의 존재 의미
+    (감사 불가 = 안전하게 차단)를 정면으로 뒤집는다. 그래서 예외 없이(크래시는 안 나되)
+    감사 불가 자체를 증거로 남겨 blocked=True로 안전측 차단해야 한다(fail-closed 유지)."""
+    conn = _seeded_conn(tmp_path)
+    holdings = [["005930"], ["000660"]]
+    v = auditor.check_survivorship(conn, holdings)
+    assert v["blocked"] is True
+    assert len(v["evidence"]) == 2
+    assert all("malformed_holding" in e for e in v["evidence"])
+
+
+def test_check_survivorship_still_blocks_real_violation_when_mixed_with_malformed_entry(tmp_path):
+    """fail-closed 안전장치 회귀 확인: 모양이 깨진 원소(list)와 실제 위반(dict)이 섞여
+    있어도, 진짜 위반(상장폐지 종목 보유)은 여전히 blocked=True로 차단해야 한다 — 방어코드가
+    하드차단 자체를 약화시키면 안 된다."""
+    conn = _seeded_conn(tmp_path)
+    conn.execute("INSERT INTO delisting(stock_code, name, delisting_date) VALUES (?,?,?)",
+                 ("000002", "죽은회사", "2025-06-30"))
+    conn.commit()
+    holdings = [["garbage"], {"date": "2025-12-31", "codes": ["000002"]}]
+    v = auditor.check_survivorship(conn, holdings)
+    assert v["blocked"] is True
+    assert any(e.get("stock_code") == "000002" for e in v["evidence"])
+
+
 # --------------------------------------------------------------------------
 # AUD-2: 미래참조편향 하드차단 (check_lookahead)
 # --------------------------------------------------------------------------
@@ -100,6 +132,33 @@ def test_check_lookahead_passes_with_real_effective_quarter(tmp_path):
     v = auditor.check_lookahead(conn, holdings)
     assert v["blocked"] is False
     assert v["evidence"] == []
+
+
+def test_check_lookahead_blocks_when_holdings_entry_is_malformed(tmp_path):
+    """check_survivorship과 동일한 재현 버그 — holdings 원소가 list면 h.get("date")에서
+    AttributeError로 죽었다. architect 검토 REJECT 근거와 동일하게, 조용히 건너뛰면
+    fail-open이 되므로 예외 없이 blocked=True로 안전측 차단해야 한다."""
+    conn = _seeded_conn(tmp_path)
+    holdings = [["005930"], ["000660"]]
+    v = auditor.check_lookahead(conn, holdings)
+    assert v["blocked"] is True
+    assert len(v["evidence"]) == 2
+    assert all("malformed_holding" in e for e in v["evidence"])
+
+
+def test_check_lookahead_still_blocks_real_violation_when_mixed_with_malformed_entry(tmp_path):
+    """fail-closed 회귀 확인: 모양이 깨진 원소와 실제 미래참조 위반이 섞여도 여전히 차단된다."""
+    conn = _seeded_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO financials(stock_code, quarter, disclosed_date, account_key, amount) "
+        "VALUES (?,?,?,?,?)",
+        ("000001", "2025Q4", "2026-02-15", "revenue", 1000.0),
+    )
+    conn.commit()
+    holdings = [["garbage"], {"date": "2025-12-31", "codes": ["000001"]}]
+    v = auditor.check_lookahead(conn, holdings, quarter_fn=lambda c, code, asof: "2025Q4")
+    assert v["blocked"] is True
+    assert any(e.get("stock_code") == "000001" for e in v["evidence"])
 
 
 # --------------------------------------------------------------------------
