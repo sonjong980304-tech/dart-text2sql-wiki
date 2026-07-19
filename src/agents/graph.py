@@ -53,6 +53,7 @@ class HierarchicalState(TypedDict, total=False):
     steps: List[Dict[str, Any]]        # 백테스트 파이프라인 스텝(있으면 backtest 도메인이 소비)
     conn: Any                          # DB 연결(노드에 클로저로 주입되지 않을 때 state 폴백)
     llm_fn: Any                        # Callable[[str], str] (동일 폴백용)
+    chart_llm_fn: Any                  # 차트 판단 전용 llm_fn(없으면 llm_fn 재사용) — web가 저가 role="chart"로 주입
     on_progress: Any                   # Callable[[str, str], None] — 실시간 진행 콜백(HA-12 확장)
 
     # 총괄 노드 산출
@@ -92,6 +93,7 @@ def supervisor_node(
     state: HierarchicalState,
     conn: Any = None,
     llm_fn: Optional[Callable[[str], str]] = None,
+    chart_llm_fn: Optional[Callable[[str], str]] = None,
 ) -> dict:
     """총괄 에이전트를 감싼 LangGraph 노드.
 
@@ -108,10 +110,17 @@ def supervisor_node(
     question = state["question"]
     conn = conn if conn is not None else state.get("conn")
     llm_fn = llm_fn if llm_fn is not None else state.get("llm_fn")
+    chart_llm_fn = chart_llm_fn if chart_llm_fn is not None else state.get("chart_llm_fn")
     steps = state.get("steps")
     on_progress = state.get("on_progress")
 
-    result = answer_with_verification(question, conn, llm_fn, steps=steps, on_progress=on_progress)
+    # chart_llm_fn은 값이 있을 때만 넘긴다(answer_with_verification 자체의 on_progress 선택적
+    # 전달 관례와 동일) — 이 노드를 감싸는 테스트/직접 호출부의 fake answer_with_verification이
+    # 이 선택적 인자를 몰라도 깨지지 않게 한다. web는 항상 저가 role="chart" llm_fn을 주입한다.
+    chart_kwargs = {"chart_llm_fn": chart_llm_fn} if chart_llm_fn is not None else {}
+    result = answer_with_verification(
+        question, conn, llm_fn, steps=steps, on_progress=on_progress, **chart_kwargs,
+    )
 
     event = {"step": "supervisor", "summary": _summarize(result)}
     return {
@@ -133,6 +142,7 @@ def supervisor_node(
 def build_hierarchical_graph(
     conn: Any,
     llm_fn: Optional[Callable[[str], str]] = None,
+    chart_llm_fn: Optional[Callable[[str], str]] = None,
 ):
     """총괄 노드 하나로 StateGraph 를 조립·컴파일한다: START → supervisor → END.
 
@@ -140,7 +150,7 @@ def build_hierarchical_graph(
     make_nodes(deps) 바인딩 관례와 동일 철학). 반환은 컴파일된 그래프(.stream()/.invoke() 지원).
     """
     def _supervisor(state: HierarchicalState) -> dict:
-        return supervisor_node(state, conn=conn, llm_fn=llm_fn)
+        return supervisor_node(state, conn=conn, llm_fn=llm_fn, chart_llm_fn=chart_llm_fn)
 
     g = StateGraph(HierarchicalState)
     g.add_node("supervisor", _supervisor)
@@ -155,6 +165,7 @@ def run_streaming(
     llm_fn: Optional[Callable[[str], str]] = None,
     steps: Optional[List[Dict[str, Any]]] = None,
     out_final: Optional[Dict[str, Any]] = None,
+    chart_llm_fn: Optional[Callable[[str], str]] = None,
 ) -> Iterator[dict]:
     """총괄 노드를 별도 스레드에서 실행하며, 그 내부 진행 상황(on_progress)을 실시간으로
     큐에서 꺼내 하나씩 yield 한다(HA-12 확장 — 실시간 트리 상세화).
@@ -190,7 +201,7 @@ def run_streaming(
 
     def _worker() -> None:
         try:
-            graph = build_hierarchical_graph(conn, llm_fn)
+            graph = build_hierarchical_graph(conn, llm_fn, chart_llm_fn)
             init: dict = {"question": question, "on_progress": on_progress}
             if steps is not None:
                 init["steps"] = steps
@@ -231,13 +242,14 @@ def run_hierarchical(
     conn: Any,
     llm_fn: Optional[Callable[[str], str]] = None,
     steps: Optional[List[Dict[str, Any]]] = None,
+    chart_llm_fn: Optional[Callable[[str], str]] = None,
 ) -> dict:
     """그래프를 `.stream()`(values 모드)으로 실행해 **최종 누적 상태**(dict)를 반환한다.
 
     스트리밍 이벤트(진행 표시)와 별개로 최종 결론/원본 도메인 결과가 필요한 호출부(HA-12의
     최종 SSE 메시지 등)를 위해, invoke 대신 stream 마지막 스냅샷을 최종 상태로 돌려준다.
     """
-    graph = build_hierarchical_graph(conn, llm_fn)
+    graph = build_hierarchical_graph(conn, llm_fn, chart_llm_fn)
     init: dict = {"question": question}
     if steps is not None:
         init["steps"] = steps

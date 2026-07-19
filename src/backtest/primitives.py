@@ -185,8 +185,8 @@ def remove_outliers(rows: list[dict], field: str, method: str = "iqr", k: float 
 def scatter_data(rows: list[dict], x_field: str, y_field: str, label_field: str = "name") -> dict:
     """rows(예: get_cross_section→remove_outliers 결과)에서 두 필드를 뽑아 산점도용 dict로 만든다.
 
-    반환 {"x":[...], "y":[...], "labels":[...], "x_field":.., "y_field":..} — 총괄
-    에이전트(_extract_scatter_data)가 이 형태를 인식해 산점도를 렌더링한다. 산점도의 한 점은
+    반환 {"x":[...], "y":[...], "labels":[...], "x_field":.., "y_field":..} — 차트
+    에이전트(chart_agent.build_chart_freeform)가 이 형태를 받아 LLM으로 산점도를 그린다. 산점도의 한 점은
     x·y 두 좌표가 모두 있어야 찍히므로, 둘 중 하나라도 None인 row는 제외한다(라벨은 label_field,
     없으면 stock_code로 폴백). "이익수익률과 투하자본수익률 산점도" 같은 파이프라인의 마지막
     단계로 쓴다.

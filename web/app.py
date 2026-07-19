@@ -161,7 +161,10 @@ def api_query(req: QueryReq):
     conn = connect_readonly()
     try:
         llm_fn = _build_llm_fn(req.model)
-        result = run_hierarchical(req.question, conn, llm_fn=llm_fn)
+        result = run_hierarchical(
+            req.question, conn, llm_fn=llm_fn,
+            chart_llm_fn=_build_llm_fn(req.model, role="chart"),
+        )
     except Exception as exc:  # noqa: BLE001 — 원인을 감추지 않고 그대로 500으로 노출
         raise HTTPException(500, f"계층형 에이전트 실행 실패: {type(exc).__name__}: {exc}") from exc
     finally:
@@ -225,7 +228,10 @@ def api_chat(req: ChatReq):
     conn = connect_readonly()
     try:
         llm_fn = _build_llm_fn(req.model)
-        turn = run_turn(session, req.question, conn, llm_fn)
+        turn = run_turn(
+            session, req.question, conn, llm_fn,
+            chart_llm_fn=_build_llm_fn(req.model, role="chart"),
+        )
     except Exception as exc:  # noqa: BLE001 — 원인을 감추지 않고 그대로 500으로 노출(api_query와 동일 관례)
         raise HTTPException(500, f"멀티턴 턴 실행 실패: {type(exc).__name__}: {exc}") from exc
     finally:
@@ -298,7 +304,10 @@ def _chat_event_stream(session_id: Optional[str], question: str, model: Optional
         try:
             conn = connect_readonly()
             llm_fn = _build_llm_fn(model)
-            turn = run_turn(session, question, conn, llm_fn, on_progress=lambda msg: q.put({"step": msg}))
+            turn = run_turn(
+                session, question, conn, llm_fn, on_progress=lambda msg: q.put({"step": msg}),
+                chart_llm_fn=_build_llm_fn(model, role="chart"),
+            )
             q.put({"_done": True, "status": turn.status, "answer": turn.answer, "error": turn.error,
                    "sql": turn.sql, "code": turn.code, "domain_evidence": turn.domain_evidence,
                    "chart_base64": turn.chart_base64, "chart_title": turn.chart_title})
@@ -354,19 +363,22 @@ def _sse_message(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
-def _build_llm_fn(model: Optional[str]):
+def _build_llm_fn(model: Optional[str], role: str = "sql"):
     """LLMClient 를 도메인 에이전트 규약(Callable[[str], str])으로 감싼다.
 
     가용하지 않으면(키/데몬 없음) None 을 반환해 총괄·도메인 로직이 결정론적 휴리스틱으로
     폴백하게 한다(src/legacy/graph/nodes.py 의 llm_fn 어댑팅 관례와 동일). 총괄→도메인이 쓰는
-    주 작업이 Text-to-SQL 이라 role="sql" 로 모델을 고른다.
+    주 작업이 Text-to-SQL 이라 기본 role="sql"(openai_model_sql 티어)로 모델을 고른다. 차트
+    종류 판정처럼 저가 모델로 충분한 호출부는 role="chart"를 넘긴다 — LLMClient.model_for가
+    sql/judge/diagnose 어디에도 안 걸리는 role을 기본 저가 모델(openai_model)로 떨어뜨리므로,
+    별도 티어 신설 없이 차트 판단만 저가 모델을 쓰게 된다(sql/judge 티어는 그대로).
     """
     from src.llm import LLMClient
 
     client = LLMClient(model=model)
     if not client.available:
         return None
-    return lambda prompt: (client.complete(prompt, role="sql").text or "")
+    return lambda prompt: (client.complete(prompt, role=role).text or "")
 
 
 def _query_event_stream(question: str, model: Optional[str]):
@@ -388,7 +400,10 @@ def _query_event_stream(question: str, model: Optional[str]):
     try:
         conn = connect_readonly()
         llm_fn = _build_llm_fn(model)
-        for event in run_streaming(question, conn, llm_fn=llm_fn, out_final=final):
+        for event in run_streaming(
+            question, conn, llm_fn=llm_fn, out_final=final,
+            chart_llm_fn=_build_llm_fn(model, role="chart"),
+        ):
             yield _sse_message(event)
         payload = {**final, "answered_by": "hierarchical"}
         yield f"event: done\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"

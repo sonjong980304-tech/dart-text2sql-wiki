@@ -155,6 +155,7 @@ def _run_followup_step(
     max_code_attempts: int = 2,
     on_progress: Callable[[str], None] | None = None,
     chart_fn: Callable | None = None,
+    chart_llm_fn: Callable[[str], str] | None = None,
 ) -> dict:
     """이전 턴 결과(prior_data)를 `data` 변수로 실행 컨텍스트에 주입해 Python만 재실행한다.
 
@@ -206,7 +207,7 @@ def _run_followup_step(
         if wants_chart(question):
             if on_progress:
                 on_progress("차트 생성 중")
-            chart = chart_fn(question, prior_data, llm_fn, execute_python_fn=execute_python_fn)
+            chart = chart_fn(question, prior_data, chart_llm_fn or llm_fn, execute_python_fn=execute_python_fn)
 
         if on_progress:
             on_progress("완료")
@@ -251,8 +252,8 @@ def _screening_csv_columns(domain_evidence: dict) -> list[str] | None:
 
 def _extract_tabular_data(domain_results: dict):
     """domain_results(도메인별 원본 결과 dict)에서 CSV로 내려받을 수 있는 표 데이터를 하나
-    찾는다. 여러 도메인이 섞인 복합질문이면 처음 찾은 표를 쓴다(질문당 CSV 1개, _build_charts
-    의 "질문당 차트" 관례와 동일한 단순화). 표가 하나도 없으면(단일값 조회 등) None.
+    찾는다. 여러 도메인이 섞인 복합질문이면 처음 찾은 표를 쓴다(질문당 CSV 1개 — 질문당
+    차트 1개 관례와 동일한 단순화). 표가 하나도 없으면(단일값 조회 등) None.
 
     스크리닝 결과(criteria 존재)면 _screening_csv_columns가 준 컬럼만 남긴 새 표를 만들어
     반환한다 — 원본 domain_results는 변경하지 않아(화면 표시용 domain_evidence 원본 유지)
@@ -288,6 +289,7 @@ def _run_new_turn(
     llm_fn: Callable[[str], str] | None,
     verified_fn: Callable,
     on_progress: Callable[[str], None] | None,
+    chart_llm_fn: Callable[[str], str] | None = None,
 ) -> Turn:
     """정형 도메인 검증(필요시 내부 자유코드 폴백까지 자동)으로 새로 조회해 세션 상태를 갱신한다.
 
@@ -305,7 +307,10 @@ def _run_new_turn(
         if on_progress:
             on_progress(f"{step}: {summary}")
 
-    result = verified_fn(question, conn, llm_fn, on_progress=_bridge if on_progress else None)
+    result = verified_fn(
+        question, conn, llm_fn, on_progress=_bridge if on_progress else None,
+        chart_llm_fn=chart_llm_fn,
+    )
     if not result.get("uncertain"):
         domain_results = result.get("domain_results") or {}
         session.current_data = domain_results
@@ -339,6 +344,7 @@ def run_turn(
     verified_fn: Callable | None = None,
     classify_fn: Callable | None = None,
     on_progress: Callable[[str], None] | None = None,
+    chart_llm_fn: Callable[[str], str] | None = None,
 ) -> Turn:
     """세션에 데이터가 없으면(또는 있어도 무관한 새 주제로 판단되면) 신규(정형 도메인 검증,
     필요시 내부 자유코드 폴백까지 자동)로, 직전 데이터와 이어지는 질문이면 이어가기(Python만)로
@@ -353,15 +359,16 @@ def run_turn(
     classify_fn = classify_fn or _classify_topic
 
     if not session.has_data:
-        return _run_new_turn(session, question, conn, llm_fn, verified_fn, on_progress)
+        return _run_new_turn(session, question, conn, llm_fn, verified_fn, on_progress, chart_llm_fn)
 
     if classify_fn(question, session.current_data, llm_fn):
         if on_progress:
             on_progress("이전 대화와 무관한 새 주제로 판단 — 새로 조회합니다")
-        return _run_new_turn(session, question, conn, llm_fn, verified_fn, on_progress)
+        return _run_new_turn(session, question, conn, llm_fn, verified_fn, on_progress, chart_llm_fn)
 
     followup = _run_followup_step(
-        question, session.current_data, llm_fn, execute_python_fn, max_code_attempts, on_progress
+        question, session.current_data, llm_fn, execute_python_fn, max_code_attempts, on_progress,
+        chart_llm_fn=chart_llm_fn,
     )
     if followup.get("ok"):
         # 다음 턴이 이어받는 맥락은 순수 result만이어야 한다(차트 유무와 무관 — 검증된 체이닝
@@ -382,7 +389,7 @@ def run_turn(
     # Python 에러 대신 "질문을 이해하지 못했습니다" 같은 더 명확한 사유로 끝난다.
     if on_progress:
         on_progress(f"이어가기 실패({followup.get('error')}) — 무관한 새 주제일 수 있어 새로 조회합니다")
-    return _run_new_turn(session, question, conn, llm_fn, verified_fn, on_progress)
+    return _run_new_turn(session, question, conn, llm_fn, verified_fn, on_progress, chart_llm_fn)
 
 
 def get_history(session: ConversationSession) -> list[dict]:

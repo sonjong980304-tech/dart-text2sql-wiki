@@ -32,7 +32,7 @@ def test_api_chat_calls_run_turn_and_returns_session_id(client, monkeypatch):
         return Turn(question=question, status="success", answer=[{"a": 1}])
 
     monkeypatch.setattr(webapp, "run_turn", fake_run_turn)
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
 
     r = client.post("/api/chat", json={"question": "코스피 PBR 낮은 순"})
 
@@ -51,7 +51,7 @@ def test_api_chat_returns_domain_evidence(client, monkeypatch):
         return Turn(question=question, status="success", answer="답", domain_evidence=ev)
 
     monkeypatch.setattr(webapp, "run_turn", fake_run_turn)
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
 
     r = client.post("/api/chat", json={"question": "코스피 PBR 낮은 순"})
 
@@ -70,7 +70,7 @@ def test_api_chat_history_includes_domain_evidence(client, monkeypatch):
         return turn
 
     monkeypatch.setattr(webapp, "run_turn", fake_run_turn)
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
 
     sid = client.post("/api/chat", json={"question": "백테스트"}).json()["session_id"]
     turns = client.get(f"/api/chat/history?session_id={sid}").json()["turns"]
@@ -86,7 +86,7 @@ def test_api_chat_reuses_same_session_across_requests(client, monkeypatch):
         return Turn(question=question, status="success", answer=[{"a": 1}])
 
     monkeypatch.setattr(webapp, "run_turn", fake_run_turn)
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
 
     first = client.post("/api/chat", json={"question": "첫 질문"}).json()
     second = client.post("/api/chat", json={"session_id": first["session_id"], "question": "이어서"}).json()
@@ -107,7 +107,7 @@ def test_api_chat_reset_clears_session(client, monkeypatch):
         return Turn(question=question, status="success", answer=[{"a": 1}])
 
     monkeypatch.setattr(webapp, "run_turn", fake_run_turn)
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
 
     first = client.post("/api/chat", json={"question": "질문1"}).json()
     sid = first["session_id"]
@@ -129,7 +129,7 @@ def test_api_chat_history_returns_turns_in_order(client, monkeypatch):
         return turn
 
     monkeypatch.setattr(webapp, "run_turn", fake_run_turn)
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
 
     first = client.post("/api/chat", json={"question": "질문1"}).json()
     sid = first["session_id"]
@@ -156,7 +156,7 @@ def test_api_chat_csv_downloads_tabular_turn(client, monkeypatch):
         return turn
 
     monkeypatch.setattr(webapp, "run_turn", fake_run_turn)
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
 
     first = client.post("/api/chat", json={"question": "질문1"}).json()
     sid = first["session_id"]
@@ -181,7 +181,7 @@ def test_api_chat_csv_non_tabular_turn_returns_400(client, monkeypatch):
         return turn
 
     monkeypatch.setattr(webapp, "run_turn", fake_run_turn)
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
 
     first = client.post("/api/chat", json={"question": "질문1"}).json()
     sid = first["session_id"]
@@ -225,7 +225,7 @@ def test_api_chat_stream_emits_progress_frames_then_done(client, monkeypatch):
         return Turn(question=question, status="success", answer=[{"a": 1}], sql="SELECT 1", code="result=rows")
 
     monkeypatch.setattr(webapp, "run_turn", fake_run_turn)
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
 
     with client.stream("GET", "/api/chat/stream", params={"question": "질문"}) as r:
         assert r.status_code == 200
@@ -245,7 +245,7 @@ def test_api_chat_stream_done_includes_domain_evidence(client, monkeypatch):
         return Turn(question=question, status="success", answer="답", domain_evidence=ev)
 
     monkeypatch.setattr(webapp, "run_turn", fake_run_turn)
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
 
     with client.stream("GET", "/api/chat/stream", params={"question": "매크로"}) as r:
         body = "".join(r.iter_text())
@@ -259,7 +259,7 @@ def test_api_chat_stream_emits_fail_event_on_exception(client, monkeypatch):
         raise RuntimeError("의도된 실패")
 
     monkeypatch.setattr(webapp, "run_turn", failing_run_turn)
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
 
     with client.stream("GET", "/api/chat/stream", params={"question": "질문"}) as r:
         body = "".join(r.iter_text())
@@ -277,8 +277,8 @@ def test_api_chat_stream_rejects_empty_question(client):
 # 회귀 — 기존 /api/query 등 단발성 질문 경로가 이번 멀티턴 API 추가로 변경되지 않았다.
 # --------------------------------------------------------------------------
 def test_existing_query_endpoint_untouched_by_chat_wiring(client, monkeypatch):
-    monkeypatch.setattr(webapp, "run_hierarchical", lambda q, conn, llm_fn: {"uncertain": False, "conclusion": "ok"})
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "run_hierarchical", lambda q, conn, llm_fn, chart_llm_fn=None: {"uncertain": False, "conclusion": "ok"})
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
     r = client.post("/api/query", json={"question": "삼성전자 PER"})
     assert r.status_code == 200
     assert r.json()["conclusion"] == "ok"

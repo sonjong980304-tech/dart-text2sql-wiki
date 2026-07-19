@@ -35,7 +35,7 @@ def _dummy_conn():
 def client(monkeypatch):
     # DB/LLM 없이 단위 검증: 읽기전용 연결과 llm_fn 빌더를 더미/None 으로 대체(네트워크 차단).
     monkeypatch.setattr(webapp, "connect_readonly", lambda *a, **k: _dummy_conn())
-    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model: None)
+    monkeypatch.setattr(webapp, "_build_llm_fn", lambda model, role="sql": None)
     return TestClient(webapp.app)
 
 
@@ -142,7 +142,7 @@ def test_api_query_empty_question_returns_400(client, monkeypatch):
 def test_api_query_threads_question_conn_llm_fn(client, monkeypatch):
     captured = {}
 
-    def fake_run_hierarchical(question, conn, llm_fn=None, steps=None):
+    def fake_run_hierarchical(question, conn, llm_fn=None, steps=None, chart_llm_fn=None):
         captured["question"] = question
         captured["conn"] = conn
         captured["llm_fn"] = llm_fn
@@ -158,7 +158,7 @@ def test_api_query_threads_question_conn_llm_fn(client, monkeypatch):
 def test_api_query_builds_llm_fn_with_selected_model(client, monkeypatch):
     seen = {}
     monkeypatch.setattr(webapp, "_build_llm_fn",
-                        lambda model: seen.setdefault("model", model) or None)
+                        lambda model, role="sql": seen.setdefault("model", model) or None)
     monkeypatch.setattr(webapp, "run_hierarchical",
                         lambda *a, **k: {"conclusion": "", "routes": [], "domain_results": {},
                                          "uncertain": False, "attempts": 1})

@@ -124,6 +124,17 @@ def test_route_prompt_mentions_qvm_for_llm_routing():
     assert "qvm" in prompt.lower() or "복합" in prompt or "멀티팩터" in prompt
 
 
+def test_route_prompt_mentions_single_indicator_screening_is_kr():
+    """LLM 우선 라우팅 반례: 특정 지표 하나를 순서대로 나열/정렬해서 그래프로 보여달라는
+    질문('PBR 오름차순 나열해서 그래프 그려줘')은 분포/히스토그램/상관관계 분석이 아니라
+    단순 스크리닝이므로 kr이다 — _route_prompt가 이 반례를 명시해, LLM이 'PBR'·'그래프'
+    단어만 보고 backtest로 오분류하지 않게 한다(실서버 재현: role=sql LLM이 ['backtest']로
+    오분류했다). backtest 설명(분포/QVM 등)과 대칭으로 넣어 두 방향 구분이 모두 프롬프트에 있다."""
+    prompt = supervisor_mod._route_prompt("아무 질문")
+    assert "단순 스크리닝" in prompt
+    assert "오름차순" in prompt
+
+
 def test_route_question_fallback_without_llm_detects_common_kr_company_nicknames():
     """실사용 재현: LLM 라우팅이 일시 실패해 휴리스틱으로 폴백했을 때, '코스피'/'삼성' 같은
     시장 키워드 없이 개별 종목 약칭만 있는 질문("하이닉스 12개월 누적수익률")이 빈 라우팅으로

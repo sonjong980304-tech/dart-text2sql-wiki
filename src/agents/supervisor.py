@@ -38,16 +38,9 @@ from datetime import date
 from typing import Callable
 
 from src.agents.chart_agent import build_chart_freeform
-from src.agents.charting import (
-    render_bar_chart_base64,
-    render_histogram_chart_base64,
-    render_line_chart_base64,
-    render_scatter_chart_base64,
-)
-from src.agents.data_price_kr import get_price_history_kr
 from src.agents.domain_backtest import answer_backtest_question
 from src.agents.domain_kr import answer_kr_question
-from src.agents.domain_macro import answer_macro_question, get_macro_history
+from src.agents.domain_macro import answer_macro_question
 from src.agents.exec_fallback import run_free_exec_fallback
 from src.llm import extract_json
 
@@ -151,6 +144,11 @@ def _route_prompt(question: str) -> str:
         "하나의 복합/종합 점수로 스크리닝하거나 그 전략으로 리밸런싱 백테스트하는 질문도 "
         "backtest입니다 — 이건 kr의 단일 지표 기준 스크리닝(예: 'PER 낮은 순 10개')과는 "
         "다른 계산(compute_qvm_scores/run_qvm_backtest)이 필요하므로 절대 kr로 보내지 마세요).\n"
+        "거꾸로, 특정 지표 하나를 기준으로 순서대로 나열/정렬해서 그 결과를 그래프로 보여달라는 "
+        "질문(예: 'PBR 오름차순으로 나열해서 그래프 그려줘', 'PER 낮은 순 10개')은 분포/"
+        "히스토그램/상관관계 분석이 아니라 단일 지표 기준 단순 스크리닝이므로 kr입니다 — "
+        "'PBR'·'그래프' 같은 단어가 섞였다고 backtest로 보내지 마세요(분포·히스토그램·상관관계·"
+        "분위수·QVM 같은 '지표를 구간/집계/합성해 분석'하는 신호가 있을 때만 backtest입니다).\n"
         "여러 도메인이 필요하면 모두 나열하세요(예: 국내 종목 스크리닝 + 백테스트 → kr, backtest).\n"
         "도메인 키워드만 콤마로 구분해 답하세요.\n\n"
         f"질문: {question}\n답:"
@@ -192,166 +190,6 @@ def wants_chart(question: str) -> bool:
     return any(kw.lower() in q for kw in _CHART_KEYWORDS)
 
 
-def _series_from_history(rows: list[dict], date_key: str, value_key: str) -> tuple[list, list]:
-    """히스토리 rows에서 (dates, values)를 뽑되 값이 None인 지점은 함께 건너뛴다(정렬 유지)."""
-    dates: list = []
-    values: list = []
-    for r in rows:
-        v = r.get(value_key)
-        if v is None:
-            continue
-        dates.append(r.get(date_key))
-        values.append(v)
-    return dates, values
-
-
-def _extract_chart_data(domain_results: dict, conn) -> tuple[list, dict, str] | None:
-    """domain_results에서 그릴 시계열을 우선순위(backtest > kr 가격 > macro)로 하나만 고른다.
-
-    반환: (dates, {"라벨": [값들], ...}, title). 그릴 데이터가 전혀 없으면(스크리닝 결과처럼
-    단일 시계열이 아닌 경우 등) 조용히 None(에러 아님 — 차트 없이 텍스트 응답만).
-
-    이번 스코프는 "질문당 차트 1개"이므로 여러 조건이 동시에 해당해도 위 우선순위로 하나만
-    그린다. kr 가격 시계열은 성능상 domain_results에 없으므로 get_price_history_kr로
-    최근 1년 종가를 조회하고, macro는 spread 시계열 하나만 그린다(다른 지표 동시 표시 안 함).
-    """
-    # 1) 백테스트 — 이미 시계열 전체(dates/navs/benchmark)를 담고 있어 재조회 불필요.
-    bt = domain_results.get("backtest")
-    if isinstance(bt, dict):
-        res = bt.get("result")
-        if isinstance(res, dict) and res.get("dates") and res.get("navs"):
-            series: dict = {"전략": list(res["navs"])}
-            bench = res.get("benchmark")
-            if bench:
-                series["벤치마크"] = list(bench)
-            return list(res["dates"]), series, "백테스트 결과"
-
-    # 2) 단일 종목 가격 — kr 도메인 결과에 stock_code가 있으면(단일종목 조회 케이스)
-    #    최근 1년 종가 시계열을 조회해 그린다(스크리닝 결과엔 stock_code가 없어 자연히 제외).
-    d = domain_results.get("kr")
-    if isinstance(d, dict) and d.get("stock_code"):
-        code = d["stock_code"]
-        dates, closes = _series_from_history(get_price_history_kr(conn, code), "date", "close")
-        if closes:
-            return dates, {f"{code} 종가": closes}, f"{code} 최근 종가 추이"
-
-    # 3) 매크로 — spread(장단기금리차) 시계열 하나만.
-    macro = domain_results.get("macro")
-    if isinstance(macro, dict) and macro.get("available"):
-        dates, spreads = _series_from_history(get_macro_history(conn), "as_of", "spread")
-        if spreads:
-            return dates, {"장단기금리차": spreads}, "장단기 금리차 추이"
-
-    return None
-
-
-def _is_scatter_shape(res) -> bool:
-    return (
-        isinstance(res, dict)
-        and res.get("x") and res.get("y")
-        and "x_field" in res and "y_field" in res
-    )
-
-
-def _is_quantile_bucket_shape(res) -> bool:
-    """quantile_bucket_means() 반환 모양([{"bucket","count","bucket_range","mean_value"}, ...])인지.
-
-    일반 스크리닝 결과(종목 리스트)도 list-of-dict라 오탐 위험이 있으므로, 반드시 이 4개
-    키를 모두 가진 dict로만 구성된 리스트일 때만 인정한다(종목 dict엔 이 조합이 없다).
-    """
-    return (
-        isinstance(res, list) and len(res) > 0
-        and all(
-            isinstance(r, dict) and {"bucket", "count", "bucket_range", "mean_value"} <= r.keys()
-            for r in res
-        )
-    )
-
-
-def _is_histogram_shape(res) -> bool:
-    """histogram_buckets() 반환 모양({"field","bucket_edges","counts",...} dict)인지.
-
-    quantile_bucket_means는 list(분위별 평균 dict의 리스트)를 반환하고 histogram은 dict 자체라
-    애초에 모양이 다르다 — 'bucket' 키 부재 검사는 quantile 개별 원소(dict)와의 오탐을 막는
-    안전장치일 뿐, 실제로 겹칠 일은 없다.
-    """
-    return (
-        isinstance(res, dict)
-        and "bucket_edges" in res and "counts" in res and "field" in res
-        and "bucket" not in res
-    )
-
-
-def _find_in_backtest_result(domain_results: dict, matcher: Callable[[object], bool]):
-    """domain_results['backtest']['result']에서 matcher를 만족하는 값을 찾는다.
-
-    pipeline_exec의 다중산출물 지원(leaf out이 2개 이상이면 {out이름: 값} dict로 반환)
-    이후, result가 산출물 그 자체(단일목적 파이프라인)일 수도 있고, 여러 산출물을 담은
-    dict(예: {"corr":.., "buckets":.., "scatter":..})일 수도 있다 — 두 모양 다 뒤진다.
-    blocked=True(하드차단)면 애초에 신뢰할 결과가 아니므로 None.
-    """
-    bt = domain_results.get("backtest")
-    if not isinstance(bt, dict) or bt.get("blocked"):
-        return None
-    res = bt.get("result")
-    if matcher(res):
-        return res
-    if isinstance(res, dict):
-        for val in res.values():
-            if matcher(val):
-                return val
-    return None
-
-
-def _extract_scatter_data(domain_results: dict) -> tuple[list, list, list | None, str, str, str] | None:
-    """domain_results에서 산점도로 그릴 데이터를 고른다(백테스트 scatter_data 프리미티브 결과).
-
-    반환: (x, y, labels, x_label, y_label, title). scatter_data 프리미티브 결과
-    {"x":[...],"y":[...],"labels":[...],"x_field":..,"y_field":..}가 result 자체에 있든,
-    (correlation/quantile_bucket_means 등과 함께 뽑힌) 다중산출물 dict 안에 중첩돼 있든
-    찾아낸다. 없으면(기존 시계열 백테스트 등) None을 반환해 _build_charts가 라인차트
-    경로로 폴백한다(기존 동작 불변).
-    """
-    res = _find_in_backtest_result(domain_results, _is_scatter_shape)
-    if res is None:
-        return None
-    x_field, y_field = res["x_field"], res["y_field"]
-    labels = list(res["labels"]) if res.get("labels") else None
-    title = f"{x_field} vs {y_field} 산점도"
-    return list(res["x"]), list(res["y"]), labels, x_field, y_field, title
-
-
-def _extract_bar_data(domain_results: dict) -> tuple[list, list, str, str, str] | None:
-    """domain_results에서 막대그래프로 그릴 분위별 평균(quantile_bucket_means) 데이터를 고른다.
-
-    반환: (labels, values, x_label, y_label, title). bucket=1이 가장 낮은 분위이므로
-    "1분위".."N분위" 라벨을 그대로 순서대로 쓴다(quantile_bucket_means 자체가 오름차순
-    정렬해 반환하므로 재정렬 불필요). 없으면 None.
-    """
-    res = _find_in_backtest_result(domain_results, _is_quantile_bucket_shape)
-    if res is None:
-        return None
-    labels = [f"{r['bucket']}분위" for r in res]
-    values = [r["mean_value"] for r in res]
-    title = "분위수별 평균값"
-    return labels, values, "분위", "평균값", title
-
-
-def _extract_histogram_data(domain_results: dict) -> tuple[list, list, str, str] | None:
-    """domain_results에서 히스토그램으로 그릴 데이터(histogram_buckets 프리미티브 결과)를 고른다.
-
-    반환: (bucket_edges, counts, x_label(=field), title). result 자체가 histogram 모양이든
-    다중산출물 dict 안에 중첩돼 있든 _find_in_backtest_result가 찾아낸다. 없으면 None.
-    """
-    res = _find_in_backtest_result(domain_results, _is_histogram_shape)
-    if res is None:
-        return None
-    edges = list(res["bucket_edges"])
-    counts = list(res["counts"])
-    field = res["field"]
-    return edges, counts, field, f"{field} 분포 히스토그램"
-
-
 def _chartable_payload(domain_results: dict):
     """차트 폴백(build_chart_freeform)에 넘길 '실제로 그릴 데이터'를 domain_results에서 꺼낸다.
 
@@ -380,61 +218,6 @@ def _chartable_payload(domain_results: dict):
     if len(payloads) == 1:
         return next(iter(payloads.values()))
     return payloads
-
-
-def _build_charts(domain_results: dict, conn) -> list[tuple[str, str]]:
-    """domain_results에서 그릴 수 있는 차트를 전부 찾아 base64 PNG 리스트로 만든다.
-
-    산점도/막대그래프는 서로 다른 산출물(예: correlation+quantile_bucket_means+
-    scatter_data를 한 파이프라인에서 함께 요청한 질문)이라 동시에 존재할 수 있으므로
-    질문당 차트 여러 개를 허용한다. 둘 다 없으면(기존 단일목적 백테스트 등) 기존
-    _extract_chart_data(시계열 3케이스)로 라인차트 1개만 폴백한다(기존 동작 불변).
-    차트 렌더링은 부가 기능이므로, 개별 렌더가 실패해도 그 항목만 건너뛰고 나머지는
-    계속 시도한다(본문 텍스트 응답을 절대 무너뜨리지 않는다).
-    """
-    charts: list[tuple[str, str]] = []
-
-    scatter = _extract_scatter_data(domain_results)
-    if scatter is not None:
-        x, y, labels, x_label, y_label, title = scatter
-        try:
-            charts.append((render_scatter_chart_base64(x, y, labels, x_label, y_label, title), title))
-        except Exception:  # noqa: BLE001 — 한 차트 실패가 나머지/본문 응답을 무너뜨리지 않게 한다
-            pass
-
-    bar = _extract_bar_data(domain_results)
-    if bar is not None:
-        labels, values, x_label, y_label, title = bar
-        try:
-            charts.append((render_bar_chart_base64(labels, values, x_label, y_label, title), title))
-        except Exception:  # noqa: BLE001
-            pass
-
-    hist = _extract_histogram_data(domain_results)
-    if hist is not None:
-        edges, counts, x_label, title = hist
-        try:
-            charts.append((render_histogram_chart_base64(edges, counts, x_label, title), title))
-        except Exception:  # noqa: BLE001
-            pass
-
-    if charts:
-        return charts
-
-    data = _extract_chart_data(domain_results, conn)
-    if data is None:
-        return []
-    dates, series, title = data
-    try:
-        return [(render_line_chart_base64(dates, series, title), title)]
-    except Exception:  # noqa: BLE001 — 차트 실패가 본문 응답을 무너뜨리지 않게 한다
-        return []
-
-
-def _build_chart(domain_results: dict, conn) -> tuple[str, str] | None:
-    """단일 차트만 필요한 호출부용 하위호환 래퍼 — _build_charts의 첫 번째 결과만 반환."""
-    charts = _build_charts(domain_results, conn)
-    return charts[0] if charts else None
 
 
 def dispatch_domains(
@@ -850,6 +633,7 @@ def answer_with_verification(
     on_progress: Callable[[str, str], None] | None = None,
     fallback_fn: Callable | None = None,
     chart_fallback_fn: Callable | None = None,
+    chart_llm_fn: Callable[[str], str] | None = None,
 ) -> dict:
     """총괄 오케스트레이션: route→dispatch→verify, 실패 시 정확히 max_retries회까지 재시도.
 
@@ -951,24 +735,21 @@ def answer_with_verification(
                 "routes": routes,
             }
             # 명시적 차트 요청("그래프/차트/그려줘" 등)이 원본 question에 있을 때만 이미지 차트를
-            # 붙인다(모든 질문에 자동으로 붙이지 않음). 그릴 데이터가 없으면 차트 필드 없이 텍스트만.
+            # 붙인다(모든 질문에 자동으로 붙이지 않음). 차트 종류 판정은 결정론적 패턴매칭 없이
+            # 전적으로 LLM(chart_fallback_fn=build_chart_freeform)에 위임한다 — matplotlib 전체에서
+            # 질문·데이터에 맞는 종류를 자유롭게 고른다. (옛 결정론 경로가 숫자 필드 1개짜리
+            # 스크리닝 결과에서 같은 필드를 x·y에 둘 다 배정해 "pbr vs pbr 산점도"를 그리던 오판이
+            # 이 구조 변경으로 근본 소거된다.) 차트 판단용 LLM은 chart_llm_fn(기본=llm_fn; web가
+            # 저가 role="chart"로 별도 주입 가능)이 맡는다. llm_fn 미가용/코드생성·실행 실패 시
+            # None → 차트 없이 텍스트 응답만(부가 기능이라 본문 응답을 절대 무너뜨리지 않는다).
             if wants_chart(question):
-                charts = _build_charts(domain_results, conn)
-                if not charts:
-                    # _build_charts는 산점도/분위수막대/히스토그램/시계열 3케이스에만 대응하는
-                    # 결정론적(LLM 미사용) 패턴매칭이다. 스크리닝 리스트처럼 이 4가지 어디에도
-                    # 안 맞는 데이터는 chart_fallback_fn(차트 서브에이전트, matplotlib 자유선택)
-                    # 으로 보강한다. 그래도 실패하면(None) 차트 없이 텍스트 응답만(에러 아님).
-                    fallback_chart = chart_fallback_fn(
-                        question, _chartable_payload(domain_results), llm_fn
-                    )
-                    if fallback_chart:
-                        charts = [(fallback_chart["chart_base64"], fallback_chart.get("chart_title"))]
-                if charts:
-                    result["chart_base64"], result["chart_title"] = charts[0]
-                    result["charts"] = [
-                        {"chart_base64": b64, "chart_title": title} for b64, title in charts
-                    ]
+                chart = chart_fallback_fn(
+                    question, _chartable_payload(domain_results), chart_llm_fn or llm_fn
+                )
+                if chart:
+                    b64, title = chart["chart_base64"], chart.get("chart_title")
+                    result["chart_base64"], result["chart_title"] = b64, title
+                    result["charts"] = [{"chart_base64": b64, "chart_title": title}]
             return result
         last_reason = verdict.get("reason")
         per_domain = verdict.get("per_domain") or {}
