@@ -120,6 +120,9 @@
     padding:3px 8px 3px 0;white-space:nowrap;width:1%;border-bottom:0}
   table.kvt td{padding:3px 0;word-break:break-word;border-bottom:0}
   .kvblock{padding:6px 0;border-top:1px solid var(--line);margin-top:6px}
+  /* 숫자는 word-break 대상에서 제외 — 글자 단위로 쪼개져 세로로 길어지는 대신
+     .table-scroll의 가로 스크롤에 맡긴다. */
+  .num{white-space:nowrap;font-variant-numeric:tabular-nums}
 
   .tree-done{color:var(--accent2);font-weight:600;margin-bottom:8px}
   .tree-fail{color:var(--bad);font-weight:600;margin-bottom:8px}
@@ -207,6 +210,19 @@ function fmtNum(v){
   return v.toLocaleString(undefined,{maximumFractionDigits:3});
 }
 
+// 1억 이상인 큰 숫자는 억/조 단위로 축약 표시해 좁은 패널에서 숫자가 한 글자씩 줄바꿈되며
+// 세로로 길어지는 걸 막는다(값 자체는 그대로, 화면 표시만 축약 — 원본 값은 title 툴팁으로 확인 가능).
+function fmtNumCompact(v){
+  const abs=Math.abs(v);
+  if(abs>=1e12) return (v/1e12).toLocaleString(undefined,{maximumFractionDigits:1})+'조';
+  if(abs>=1e8) return (v/1e8).toLocaleString(undefined,{maximumFractionDigits:1})+'억';
+  return fmtNum(v);
+}
+function numHtml(v){
+  const compact=fmtNumCompact(v), full=fmtNum(v);
+  return compact===full ? `<span class="num">${full}</span>` : `<span class="num" title="원본값: ${esc(full)}">${compact}</span>`;
+}
+
 async function loadModels(){
   const sel=document.getElementById('modelSel');
   try{
@@ -273,7 +289,7 @@ function renderKV(v){
   if(v==null) return '<span class="muted">—</span>';
   if(Array.isArray(v)){
     if(!v.length) return '<span class="muted">[]</span>';
-    if(v.every(x=>x===null||typeof x!=='object')) return v.map(x=>typeof x==='number'?fmtNum(x):esc(x)).join(', ');
+    if(v.every(x=>x===null||typeof x!=='object')) return v.map(x=>typeof x==='number'?numHtml(x):esc(x)).join(', ');
     if(v.every(x=>x!==null&&typeof x==='object'&&!Array.isArray(x))){
       const cols=[...new Set(v.flatMap(o=>Object.keys(o)))];
       let h='<div class="table-scroll"><table><thead><tr>'+cols.map(c=>`<th>${esc(c)}</th>`).join('')+'</tr></thead><tbody>';
@@ -293,7 +309,7 @@ function renderKV(v){
     return `<div class="table-scroll"><table class="kvt"><tbody>${entries.map(([k,val])=>
       `<tr><th>${esc(k)}</th><td>${renderKV(val)}</td></tr>`).join('')}</tbody></table></div>`;
   }
-  return typeof v==='number'?fmtNum(v):esc(v);
+  return typeof v==='number'?numHtml(v):esc(v);
 }
 
 function renderEvidenceCode(sql, code){
