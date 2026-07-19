@@ -128,20 +128,21 @@ def test_detect_below_threshold_not_flagged(tmp_path):
 def test_get_excluded_codes_computes_and_caches(tmp_path):
     conn = _conn(tmp_path)
     _seed_price_series(conn, "UP20", [105.0] * 10 + [2100.0] * 10)
-    codes = get_price_quality_excluded_codes(conn)
+    codes = get_price_quality_excluded_codes(conn)  # asof 없음 → 이상종목 전체(하위호환)
     assert codes == {"UP20"}
-    cached = get_meta(conn, "price_quality_excluded_codes")
-    assert cached == "UP20"
+    # 캐시는 이제 '종목→이상 발생일 목록' 매핑(JSON)이다(asof-aware 국소 제외의 근거).
+    cached = get_meta(conn, "price_quality_anomaly_dates")
+    assert cached is not None and "UP20" in cached
     conn.close()
 
 
-def test_get_excluded_codes_empty_result_cached_as_empty_string(tmp_path):
+def test_get_excluded_codes_empty_result_cached_as_empty_map(tmp_path):
     conn = _conn(tmp_path)
     _seed_price_series(conn, "NORMAL", [10000.0 + i * 10 for i in range(30)])
     codes = get_price_quality_excluded_codes(conn)
     assert codes == set()
-    cached = get_meta(conn, "price_quality_excluded_codes")
-    assert cached == ""  # 빈 문자열로 캐시(재스캔 방지, None과 구분)
+    cached = get_meta(conn, "price_quality_anomaly_dates")
+    assert cached == "{}"  # 빈 매핑도 캐시(재스캔 방지, None과 구분)
     conn.close()
 
 
@@ -171,12 +172,13 @@ def test_metrics_at_excludes_anomalous_stock_from_backtest_universe(tmp_path):
     _seed_company(conn, "000001", "정상전자")
     _seed_company(conn, "000002", "이상화학")
     _seed_price_series(conn, "000001", [10000.0 + i * 10 for i in range(60)])
-    _seed_price_series(conn, "000002", [105.0] * 30 + [2100.0] * 30)  # 이상(20배 점프)
+    # 이상치가 asof(2026-06-30) 근처에서 발생해야 국소 제외 윈도우에 걸린다(2026-05-31 점프).
+    _seed_price_series(conn, "000002", [105.0] * 30 + [2100.0] * 30, start="2026-05-01")  # 이상(20배 점프)
 
     rows = metrics_at(conn, "2026-06-30")
     codes = {r["stock_code"] for r in rows}
     assert "000001" in codes  # 정상 종목은 영향 없음(회귀)
-    assert "000002" not in codes  # 이상 종목은 유니버스에서 제외
+    assert "000002" not in codes  # 이상 종목은 유니버스에서 제외(이상일 근처 asof)
     conn.close()
 
 
@@ -205,10 +207,87 @@ def test_get_cross_section_excludes_anomalous_stock_before_top_n():
         _seed_company(conn, "000001", "정상전자")
         _seed_company(conn, "000002", "이상화학")
         _seed_price_series(conn, "000001", [10000.0 + i * 10 for i in range(60)])
-        _seed_price_series(conn, "000002", [105.0] * 30 + [2100.0] * 30)
+        # 이상치가 asof(2026-06-30) 근처에서 발생해야 국소 제외 윈도우에 걸린다.
+        _seed_price_series(conn, "000002", [105.0] * 30 + [2100.0] * 30, start="2026-05-01")
 
         rows = get_cross_section(conn, "2026-06-30")
         codes = {r["stock_code"] for r in rows}
         assert "000001" in codes
         assert "000002" not in codes
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 4) asof-aware 국소 제외: 이상치 발생일 근처 asof에서만 제외(생존편향 재유입 방지)
+#
+# 종목 전체를 모든 시점에서 영구 제외하던 기존 방식은, 상폐 직전 정리매매/감자/거래재개로
+# 큰 가격변동을 겪은 종목의 '정상 거래기간' 데이터까지 모든 asof에서 함께 지워 생존편향을
+# 재유입시켰다(상폐 종목 41%가 통째로 제외). 이제는 이상치 발생일 근처 asof에서만 제외한다.
+# ---------------------------------------------------------------------------
+def _seed_price_rows(conn, code, rows):
+    """(date, close) 튜플 목록을 그대로 적재(비연속 날짜 허용 — 정상기간·이상기간을 떨어뜨려 심는다)."""
+    for d, c in rows:
+        conn.execute(
+            "INSERT INTO prices(stock_code, date, close) VALUES (?,?,?)",
+            (code, d, float(c)),
+        )
+    conn.commit()
+
+
+def test_detect_anomaly_dates_returns_dates(tmp_path):
+    """detect_price_quality_anomaly_dates 는 종목별 '이상 변동이 나타난 거래일' 목록을 반환한다."""
+    from src.data_quality import detect_price_quality_anomaly_dates
+
+    conn = _conn(tmp_path)
+    _seed_price_rows(
+        conn,
+        "CRASH",
+        [("2022-06-14", 1000), ("2022-06-15", 1000), ("2022-06-16", 50)],  # 폭락(ratio 0.05)
+    )
+    dates_map = detect_price_quality_anomaly_dates(conn)
+    assert dates_map.get("CRASH") == ["2022-06-16"]  # 폭락이 나타난 날
+    conn.close()
+
+
+def test_get_excluded_codes_asof_near_anomaly_excludes(tmp_path):
+    """asof가 이상치 발생일 근처면 그 종목을 제외한다(진짜 데이터오류 방어는 유지)."""
+    conn = _conn(tmp_path)
+    _seed_price_rows(conn, "CRASH", [("2022-06-15", 1000), ("2022-06-16", 50)])
+    excluded = get_price_quality_excluded_codes(conn, asof="2022-07-31")
+    assert "CRASH" in excluded
+    conn.close()
+
+
+def test_get_excluded_codes_asof_far_before_anomaly_keeps(tmp_path):
+    """asof가 이상치 발생일보다 충분히 이전(2년 전)이면 제외하지 않는다(정상기간 데이터 보존)."""
+    conn = _conn(tmp_path)
+    _seed_price_rows(
+        conn,
+        "CRASH",
+        [("2020-06-15", 1000), ("2022-06-15", 1000), ("2022-06-16", 50)],
+    )
+    excluded = get_price_quality_excluded_codes(conn, asof="2020-06-30")
+    assert "CRASH" not in excluded
+    conn.close()
+
+
+def test_metrics_at_keeps_stock_at_asof_far_before_price_anomaly(tmp_path):
+    """상폐 직전 정리매매로 큰 가격변동을 겪은 종목도, 그 변동보다 2년 전 asof 백테스트에서는
+    제외되지 않는다(핵심 회귀: 생존편향 재유입 방지). 반대로 이상일 근처 asof에서는 여전히 제외된다."""
+    conn = _conn(tmp_path)
+    _seed_company(conn, "000009", "상폐예정", quarter="2020Q1", disclosed="2020-05-15")
+    _seed_price_rows(
+        conn,
+        "000009",
+        [
+            ("2020-01-02", 1000), ("2020-03-31", 1000),  # 정상 거래기간(2020)
+            ("2022-06-15", 1000), ("2022-06-16", 50),    # 상폐 직전 정리매매 폭락(2022)
+        ],
+    )
+    # 이상치 2년 전 시점 → 제외되면 안 됨(정상 거래기간 수익률 데이터는 살아있어야 함).
+    codes_far = {r["stock_code"] for r in metrics_at(conn, "2020-06-30")}
+    assert "000009" in codes_far
+    # 이상치 근처 시점 → 제외됨(오염된 가격 구간 방어는 그대로 동작).
+    codes_near = {r["stock_code"] for r in metrics_at(conn, "2022-06-30")}
+    assert "000009" not in codes_near
+    conn.close()

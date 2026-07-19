@@ -1,4 +1,4 @@
-"""가격 데이터 품질 게이트 — 신뢰 못 할 종목을 계산에서 통째로 제외한다.
+"""가격 데이터 품질 게이트 — 가격 불연속으로 오염된 (종목, 시점) 조합을 계산에서 제외한다.
 
 배경
 ----
@@ -10,32 +10,38 @@ prices.close 에 "하루 만에 종가가 2배 이상 뛰거나 절반 이하로
 원인이 다양하고 계속 새로운 예외 케이스가 발견되므로(예: 246830 시냅스엠은 상승
 정수배 점프 외에 하락 폭락 구간도 섞여 있어 배율 하나로 "복원"이 안 됐고, 상승만
 보던 기존 임계값(abs(ratio-1)>1.0, scripts/fix_split_discontinuities.py)은 하락
-폭락을 아예 못 잡는 사각지대였다), 배율을 찾아 곱해서 "고치는" 접근 대신 **신뢰
-못 할 종목 전체를 계산에서 빼는** 더 안전하고 유지보수하기 쉬운 접근으로 전환한다.
+폭락을 아예 못 잡는 사각지대였다), 배율을 찾아 곱해서 "고치는" 접근 대신 **오염된
+가격 구간을 계산에서 빼는** 더 안전하고 유지보수하기 쉬운 접근을 쓴다.
 
 판정
 ----
-종목의 전체 가격 이력 중 어디든 인접 거래일 종가비가 2배 이상(ratio>=2.0) 이거나
-1/2 이하(ratio<=0.5)면 그 종목 전체를 제외한다 — 종목 단위 블랭킷 제외다(특정
-구간만 빼는 정교한 방식이 아니다. 단순하고 안전한 쪽을 택함). 상승/하락을 대칭으로
-본다: 배율로 보면 2배 점프든 1/2배 급락이든 크기가 같은 비정상 변동이다.
+인접 거래일 종가비가 2배 이상(ratio>=2.0) 이거나 1/2 이하(ratio<=0.5)면 그 날을
+'이상 발생일 D'로 본다(상승/하락 대칭 — 배율로 보면 2배 점프든 1/2배 급락이든 크기가
+같은 비정상 변동이다). 제외는 **종목 전체를 영구히 빼는 게 아니라 D 근처의 백테스트
+시점(asof)에서만** 한다(asof-aware 국소 제외 — 윈도우 근거는 PRICE_ANOMALY_WINDOW_*
+상수와 get_price_quality_excluded_codes 참조). 종목 전체를 모든 시점에서 빼면, 상폐
+직전 정리매매/감자/거래재개 등으로 큰 변동을 겪은 종목의 '정상 거래기간' 데이터까지
+함께 사라져(상폐 종목 41%가 통째로 제외됐다) 생존편향이 다른 경로로 재유입된다 — 이
+게이트가 바로 그 편향을 막으려는 것이므로 국소 제외로 좁혔다. 단, 진짜 데이터오류를
+잡는 안전장치 자체는 유지한다(정리매매/감자 여부를 과거 이력에서 판별할 데이터소스가
+없어 '진짜 이상치 vs 합법적 변동'은 구분하지 않는다 — 범위만 좁힌다).
 
 캐싱
 ----
-전체 스캔(prices ~840만 행, LAG 윈도우+DISTINCT)은 실측 약 6~7초 걸린다(2026-07
-data/market.db 기준). 백테스트 1회 실행이 리밸런싱 시점마다 유니버스(=metrics_at)를
-여러 번 구성하는 구조라 요청마다 돌리기엔 비싸므로, ingest_meta에 결과를 CSV로
+전체 스캔(prices ~840만 행, LAG 윈도우)은 실측 약 6~7초 걸린다(2026-07 data/market.db
+기준). 백테스트 1회 실행이 리밸런싱 시점마다 유니버스(=metrics_at)를 여러 번 구성하는
+구조라 요청마다 돌리기엔 비싸므로, ingest_meta에 '종목→이상 발생일 목록' 매핑을 JSON으로
 캐싱한다(기존 usdkrw_rate/inactive_codes 캐싱 관례와 동일 패턴 — src/ingest/dart.py
-inactive_codes, src/ingest/exchange_rate.py usdkrw_rate 참고). 최초 호출 시 계산해
-저장하고, 이후 호출은 ingest_meta 단건 조회(수 ms)로 끝난다.
+inactive_codes, src/ingest/exchange_rate.py usdkrw_rate 참고). 최초 호출 시 스캔해 저장하고,
+이후 호출은 ingest_meta 단건 조회(수 ms) + asof별 윈도우 필터(메모리 내)로 끝난다.
 
 캐시가 있으면 재스캔하지 않으므로, 새로 적재된 가격에서 생긴 이상치는 즉시 반영되지
-않는다(다음 refresh=True 호출 전까지). 이 트레이드오프는 의도적이다 — "신뢰 못 할
-종목은 어차피 과거 이력이 오염된 것"이므로 하루이틀 늦게 걸러져도(최악의 경우) 매
-요청마다 6~7초를 태우는 것보다 안전하다.
+않는다(다음 refresh=True 호출 전까지). 이 트레이드오프는 의도적이다 — 하루이틀 늦게
+걸러져도(최악의 경우) 매 요청마다 6~7초를 태우는 것보다 낫다.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from .db import get_meta, set_meta
@@ -47,7 +53,21 @@ from .version import now_iso
 JUMP_RATIO_HIGH = 2.0
 JUMP_RATIO_LOW = 0.5
 
-_CACHE_KEY = "price_quality_excluded_codes"
+# ── asof-aware 국소 제외 윈도우 ──────────────────────────────────────────────
+# 이상치(가격 불연속)는 특정 거래일 D 에 발생한다. 백테스트 지표는 모두 과거만 보므로
+# (룩어헤드 금지) D 이전 asof 는 원래 오염되지 않지만, 다일에 걸친 이벤트/경계 흔들림에
+# 대한 안전여유로 D 이전 1개월까지만 제외한다. D 이후는 return_12m(12개월 룩백) 수익률
+# 윈도우 [asof-12m, asof] 가 D 를 품는 동안(asof∈[D, D+12m]) 수익률이 오염되므로 12개월을
+# 제외한다. 그 밖의(충분히 먼) asof 에서는 그 종목의 정상 거래기간 데이터를 살려둔다 —
+# 상폐 직전 정리매매/감자 등의 큰 변동 때문에 종목이 통째로 빠져 생존편향이 재유입되던
+# 문제를 막는다(설계 근거는 get_price_quality_excluded_codes 참조).
+PRICE_ANOMALY_WINDOW_BEFORE_MONTHS = 1
+PRICE_ANOMALY_WINDOW_AFTER_MONTHS = 12
+
+# 캐시는 '종목→이상 발생일 목록' 매핑(JSON). 예전엔 종목코드 CSV 만 캐싱했으나, 국소
+# 제외가 발생일을 알아야 하므로 발생일까지 담는 새 키로 바꿨다(구 CSV 캐시와 형식이
+# 달라 혼선을 막으려 키 이름도 교체 — 구 캐시는 자연히 무시되고 최초 호출 때 재계산된다).
+_CACHE_KEY_DATES = "price_quality_anomaly_dates"
 _CACHE_KEY_AT = "price_quality_excluded_at"
 
 # ── 물적분할(스핀오프) 시차 가드 임계값 ──────────────────────────────────────
@@ -66,16 +86,19 @@ SPINOFF_RATIO_LOW = 0.5
 SPINOFF_LOOKBACK_MONTHS = 3  # 직전 유효분기 ≈ 3개월 전
 
 
-def detect_price_quality_anomalies(
+def detect_price_quality_anomaly_dates(
     conn: sqlite3.Connection,
     ratio_high: float = JUMP_RATIO_HIGH,
     ratio_low: float = JUMP_RATIO_LOW,
-) -> set[str]:
-    """전체 이력을 스캔해, 인접 거래일 종가비가 [ratio_low, ratio_high] 구간 밖인 종목코드 집합.
+) -> dict[str, list[str]]:
+    """전체 이력을 스캔해, 인접 거래일 종가비가 [ratio_low, ratio_high] 구간 밖인 '이상 발생일'을
+    종목별로 모은 매핑({stock_code: [date, ...]}).
 
-    scripts/fix_split_discontinuities._raw_jumps 와 동일한 LAG 윈도우 SQL을 대칭
-    임계값으로 재사용한다. 캐시를 거치지 않는 순수 스캔 함수라 실제 대용량 DB에서는
-    수 초가 걸릴 수 있다(캐싱은 get_price_quality_excluded_codes가 담당).
+    date 는 이상 변동이 나타난 거래일(비율의 분자 쪽 — 점프/폭락이 관측된 날)이다. asof-aware
+    국소 제외(get_price_quality_excluded_codes)가 이 발생일을 기준으로 제외 윈도우를 잡는다.
+    scripts/fix_split_discontinuities._raw_jumps 와 동일한 LAG 윈도우 SQL을 대칭 임계값으로
+    재사용한다. 캐시를 거치지 않는 순수 스캔 함수라 실제 대용량 DB에서는 수 초가 걸릴 수 있다
+    (캐싱은 get_price_quality_anomaly_dates가 담당). 종목별 date 는 오름차순으로 정렬된다.
     """
     rows = conn.execute(
         """
@@ -84,19 +107,37 @@ def detect_price_quality_anomalies(
                  LAG(close) OVER (PARTITION BY stock_code ORDER BY date) AS prev_close
           FROM prices WHERE close IS NOT NULL AND close > 0
         )
-        SELECT DISTINCT stock_code FROM ch
+        SELECT stock_code, date FROM ch
         WHERE prev_close IS NOT NULL AND prev_close > 0
           AND (close / prev_close >= ? OR close / prev_close <= ?)
+        ORDER BY stock_code, date
         """,
         (ratio_high, ratio_low),
     ).fetchall()
-    return {r["stock_code"] for r in rows}
+    out: dict[str, list[str]] = {}
+    for r in rows:
+        out.setdefault(r["stock_code"], []).append(r["date"])
+    return out
 
 
-def get_price_quality_excluded_codes(
-    conn: sqlite3.Connection, refresh: bool = False
+def detect_price_quality_anomalies(
+    conn: sqlite3.Connection,
+    ratio_high: float = JUMP_RATIO_HIGH,
+    ratio_low: float = JUMP_RATIO_LOW,
 ) -> set[str]:
-    """제외 대상 종목코드 집합(ingest_meta 캐시 우선).
+    """이상치가 하나라도 있는 종목코드 집합(발생일 정보를 버린 얇은 래퍼).
+
+    detect_price_quality_anomaly_dates 의 키 집합이다 — '이 종목의 과거 이력에 불연속이
+    있는가'만 알면 되는 진단·통계용 하위호환 API. 실제 백테스트 제외는 asof-aware 국소
+    판정(get_price_quality_excluded_codes)을 쓴다.
+    """
+    return set(detect_price_quality_anomaly_dates(conn, ratio_high, ratio_low).keys())
+
+
+def get_price_quality_anomaly_dates(
+    conn: sqlite3.Connection, refresh: bool = False
+) -> dict[str, list[str]]:
+    """종목별 가격 이상 발생일 매핑(ingest_meta JSON 캐시 우선).
 
     refresh=False(기본): 캐시가 있으면 그대로 반환(재스캔 없음). 캐시가 없으면(최초
     호출) 자동으로 스캔해 채운다.
@@ -104,13 +145,13 @@ def get_price_quality_excluded_codes(
     가격 적재 후 최신화하려는 배치 호출용).
     """
     if not refresh:
-        cached = get_meta(conn, _CACHE_KEY)
+        cached = get_meta(conn, _CACHE_KEY_DATES)
         if cached is not None:
-            return set(cached.split(",")) if cached else set()
+            return json.loads(cached)
 
-    codes = detect_price_quality_anomalies(conn)
+    dates_map = detect_price_quality_anomaly_dates(conn)
     try:
-        set_meta(conn, _CACHE_KEY, ",".join(sorted(codes)))
+        set_meta(conn, _CACHE_KEY_DATES, json.dumps(dates_map, sort_keys=True))
         set_meta(conn, _CACHE_KEY_AT, now_iso())
         conn.commit()
     except sqlite3.OperationalError:
@@ -119,7 +160,41 @@ def get_price_quality_excluded_codes(
         # 계산 결과 자체는 정상 반환하고 캐시 저장만 건너뛴다 — 다음에 쓰기가능
         # 연결(배치 갱신 스크립트 등)이 호출될 때 캐시가 채워진다.
         pass
-    return codes
+    return dates_map
+
+
+def get_price_quality_excluded_codes(
+    conn: sqlite3.Connection, asof: str | None = None, refresh: bool = False
+) -> set[str]:
+    """제외 대상 종목코드 집합.
+
+    asof 를 주면 국소(asof-aware) 제외 — 각 종목의 이상 발생일 D 주변
+    [D-BEFORE, D+AFTER] 윈도우(PRICE_ANOMALY_WINDOW_*_MONTHS)에 asof 가 들어갈 때만 그
+    종목을 제외한다. 이상치와 충분히 먼(과거) asof 에서는 제외하지 않아, 상폐 직전 정리매매
+    /감자 등으로 큰 변동을 겪은 종목의 정상 거래기간 데이터가 모든 시점에서 함께 사라져
+    생존편향이 재유입되던 문제를 막는다.
+
+    asof 를 생략(None)하면 하위호환으로 '이상치가 하나라도 있는 모든 종목'을 반환한다
+    (진단·통계 등 asof 문맥이 없는 호출용).
+    """
+    dates_map = get_price_quality_anomaly_dates(conn, refresh=refresh)
+    if asof is None:
+        return set(dates_map.keys())
+
+    # D±개월 경계는 backtest.data_access._months_before 로 잡는다(모듈 순환참조를 피하려
+    # 함수 안에서 지연 import — is_equity_ratio_anomalous 와 동일 패턴). 음수 개월은 미래
+    # 방향(D+after)을 뜻한다. ISO 날짜는 사전식 비교 = 시간 비교라 문자열로 바로 대소 비교한다.
+    from .backtest.data_access import _months_before
+
+    excluded: set[str] = set()
+    for code, dates in dates_map.items():
+        for d in dates:
+            lo = _months_before(d, PRICE_ANOMALY_WINDOW_BEFORE_MONTHS)   # D - before
+            hi = _months_before(d, -PRICE_ANOMALY_WINDOW_AFTER_MONTHS)   # D + after
+            if lo <= asof <= hi:
+                excluded.add(code)
+                break
+    return excluded
 
 
 def is_equity_ratio_anomalous(

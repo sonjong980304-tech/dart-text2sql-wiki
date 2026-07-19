@@ -308,10 +308,13 @@ METRIC_FIELD_DESCRIPTIONS: dict[str, str] = {
 def metrics_at(conn, asof: str) -> list[dict]:
     """시점 asof의 유효 지표 행 목록 (look-ahead/생존편향/이상치 가드 적용)."""
     companies = conn.execute("SELECT stock_code, name, sector, market FROM company").fetchall()
-    # 가격 이력이 신뢰 못 할(액면분할/병합 미반영 등으로 과거 종가가 불연속한) 종목은
-    # 종목 단위로 통째로 제외한다(src/data_quality.py). 백테스트 유니버스·스크리닝
-    # (get_cross_section이 이 함수를 기본 metrics_fn으로 씀) 양쪽에 동시 적용된다.
-    excluded_codes = get_price_quality_excluded_codes(conn)
+    # 가격 이력에 불연속(하루 만에 종가 2배↑/반토막)이 있는 종목은, 그 이상치 발생일
+    # 근처의 asof 에서만 국소 제외한다(종목 전체를 모든 시점에서 영구 제외하던 방식 →
+    # asof-aware). 상폐 직전 정리매매/감자 등으로 생긴 변동 때문에 그 종목의 정상 거래기간
+    # 데이터까지 모든 시점에서 빠져 생존편향이 재유입되던 문제를 막는다(src/data_quality.py).
+    # 백테스트 유니버스·스크리닝(get_cross_section이 이 함수를 기본 metrics_fn으로 씀)
+    # 양쪽에 동시 적용된다.
+    excluded_codes = get_price_quality_excluded_codes(conn, asof)
     out = []
     for c in companies:
         code = c["stock_code"]
