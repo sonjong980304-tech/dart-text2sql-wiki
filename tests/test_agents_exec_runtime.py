@@ -292,6 +292,20 @@ def test_execute_python_extra_is_empty_dict_on_failure():
     assert res["extra"] == {}
 
 
+def test_execute_python_forces_agg_backend_for_matplotlib_code():
+    """LLM 자유 차트 코드(build_chart_freeform)가 matplotlib.use(...)를 스스로 안 불러도
+    헤드리스(Agg) 백엔드가 강제되어야 한다.
+
+    실사용 재현: macOS(GUI 세션 있는 머신)에서 LLM이 짠 코드가 backend 설정 없이
+    matplotlib을 import하면 기본값이 대화형 백엔드(macosx)로 잡혀 실제 GUI 창이 뜨고
+    실행이 막힌다(charting.py의 기존 4개 헬퍼는 matplotlib.use("Agg")를 코드에 박아둬서
+    이 문제가 없었지만, LLM이 자유롭게 쓰는 코드는 그 안전장치가 없었다).
+    """
+    res = execute_python("import matplotlib\nresult = matplotlib.get_backend()")
+    assert res["ok"] is True
+    assert res["result"].lower() == "agg"
+
+
 def test_execute_python_child_supports_extra_vars_param():
     """_execute_python_child가 extra_vars 파라미터로 3-tuple(ok, value, extra)를 보낸다."""
     import multiprocessing as mp

@@ -176,6 +176,25 @@ def _execute_python_child(
     except ImportError:
         pass  # resource 모듈은 POSIX 전용(Windows엔 없음) — 없어도 타임아웃이 백스톱
 
+    if "matplotlib" in code:
+        # LLM이 자유롭게 쓴 차트 코드(build_chart_freeform)는 charting.py의 기존 4개
+        # 헬퍼와 달리 matplotlib.use("Agg")를 스스로 호출한다는 보장이 없다 — 실측
+        # 확인(macOS): backend 미설정 시 기본값이 대화형 백엔드(macosx)로 잡혀 실제 GUI
+        # 창이 뜨고 실행이 막힌다. 프롬프트 안내에만 기대지 않고(LLM이 빠뜨릴 수 있음)
+        # 여기서 exec() 전에 강제한다 — pyplot이 아직 import되기 전이므로 이 설정이
+        # 이후 코드의 `import matplotlib.pyplot`에도 그대로 적용된다. 한글 폰트도
+        # charting.py와 동일한 안전장치(_configure_korean_font, 못 찾으면 조용히 폴백)를
+        # 재사용해 "Glyph ... missing" 경고로 한글이 깨지는 문제도 함께 막는다.
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            from src.agents.charting import _configure_korean_font
+
+            _configure_korean_font(matplotlib)
+        except Exception:  # noqa: BLE001 — 안전장치 설정 실패로 전체 실행을 막지 않는다
+            pass
+
     namespace: dict = dict(context)
     try:
         exec(code, namespace)  # noqa: S102 — 신뢰불가 코드의 임의 실행(사용자 승인 트레이드오프)
