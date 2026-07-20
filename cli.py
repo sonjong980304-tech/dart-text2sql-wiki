@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DART/pykrx Text-to-SQL + LLM Wiki — CLI 진입점.
+"""Quant Assistant — CLI 진입점 (레거시 6노드 SQL 생성 파이프라인 + 질의기록 위키).
 
 사용 예:
   python cli.py setup-dummy                 # 더미 데이터 생성
@@ -276,7 +276,7 @@ def cmd_wiki(args):
 # 파서
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DART/pykrx Text-to-SQL + 질의 기록")
+    parser = argparse.ArgumentParser(description="Quant Assistant CLI — 레거시 SQL 생성 파이프라인 + 질의 기록")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("setup-dummy", help="더미 데이터 생성")

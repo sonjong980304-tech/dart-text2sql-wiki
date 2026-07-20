@@ -368,7 +368,7 @@ def _build_llm_fn(model: Optional[str], role: str = "sql"):
 
     가용하지 않으면(키/데몬 없음) None 을 반환해 총괄·도메인 로직이 결정론적 휴리스틱으로
     폴백하게 한다(src/legacy/graph/nodes.py 의 llm_fn 어댑팅 관례와 동일). 총괄→도메인이 쓰는
-    주 작업이 Text-to-SQL 이라 기본 role="sql"(openai_model_sql 티어)로 모델을 고른다. 차트
+    주 작업이 SQL·파이썬 코드 생성이라 기본 role="sql"(openai_model_sql 티어)로 모델을 고른다. 차트
     종류 판정처럼 저가 모델로 충분한 호출부는 role="chart"를 넘긴다 — LLMClient.model_for가
     sql/judge/diagnose 어디에도 안 걸리는 role을 기본 저가 모델(openai_model)로 떨어뜨리므로,
     별도 티어 신설 없이 차트 판단만 저가 모델을 쓰게 된다(sql/judge 티어는 그대로).

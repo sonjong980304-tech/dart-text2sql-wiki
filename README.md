@@ -29,10 +29,9 @@
 | ![CAGR·MDD·샤프비율 등 11개 성과지표, 전략과 시장을 비교하는 수익곡선, 분기별 보유종목 교체내역이 표시된 백테스트 결과 화면](docs/screenshots/05-backtest-result.png) | **백테스트 결과** — CAGR·MDD·샤프·소르티노·승률·베타 등 11개 성과지표와 전략 대 시장(동일가중) 수익곡선, 그리고 리밸런싱마다 어떤 종목이 편입·편출됐는지 분기별 이력까지 함께 보여줍니다. |
 | ![몬테카를로로 최적화한 4자산 목표비중과 21년치 walk-forward 백테스트 자산곡선이 표시된 올웨더 포트폴리오 화면](docs/screenshots/06-allweather.png) | **올웨더 포트폴리오** — QQQ·삼성전자·TLT·ACE KRX금현물 4자산의 목표비중을 매달 몬테카를로로 재계산하고, 2004년부터 약 21.6년치 walk-forward 백테스트 곡선으로 신뢰도를 함께 보여주는 모니터링 전용 화면입니다. |
 
-> 위 6개 파일은 `docs/screenshots/`에 그 파일명 그대로 저장하면 표에 바로 나타납니다(현재는
-> 폴더만 만들어둔 상태입니다 — 스크린샷 원본을 이 이름으로 저장해주세요:
-> `01-query-progress.png`, `02-query-result.png`, `03-macro-signal.png`,
-> `04-backtest-settings.png`, `05-backtest-result.png`, `06-allweather.png`).
+> 위 6개 파일(`01-query-progress.png`, `02-query-result.png`, `03-macro-signal.png`,
+> `04-backtest-settings.png`, `05-backtest-result.png`, `06-allweather.png`)은 이미
+> `docs/screenshots/`에 반영돼 있어 표에 그대로 표시됩니다.
 
 ---
 
@@ -718,7 +717,7 @@ OLLAMA_MODEL=qwen2.5-coder:7b-instruct-q4_K_M
 ## 디렉토리 구조
 
 ```
-dart-text2sql-wiki/
+quant-assistant/
 ├── cli.py                    # CLI 진입점 (legacy 파이프라인 사용)
 ├── requirements.txt
 ├── .env.example

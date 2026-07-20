@@ -80,7 +80,7 @@ def judge_hierarchical_answer(
         return {"applicable": False, "match": None, "reason": "judge LLM 미가용"}
     gold_sample = gold_rows[:sample_n]
     prompt = (
-        "당신은 Text-to-SQL 계층형 에이전트의 답변을 채점하는 평가자입니다.\n"
+        "당신은 한국주식/매크로/백테스트 계층형 에이전트의 답변을 채점하는 평가자입니다.\n"
         "아래 '정답'은 정답 SQL 을 실행한 결과(행 목록)이고, '시스템 답변'은 신규 계층형\n"
         "구조가 낸 종합결론과 도메인별 원본결과입니다. 시스템 답변이 정답과 사실상 같은\n"
         "정보를 담고 있으면(핵심 종목/수치/순위가 일치) match=true, 아니면 match=false 입니다.\n"

@@ -10,18 +10,18 @@ Mac launchd로 주가/재무를 자동 증분 갱신한다. 두 작업 모두 **
 | `com.darttext.updatefinancials.plist` | 매일 07:30 | 새로 공시된 분기 재무만 증분 적재 | 0 (미사용) |
 
 수집 단계에서는 LLM을 전혀 호출하지 않으므로 **갱신 비용은 0**이다.
-(LLM은 질의 시 Text-to-SQL에만 쓰인다.)
+(LLM은 사용자 질의 시에만 쓰인다 — SQL 생성뿐 아니라 파이썬 코드 생성·차트 생성 등에도 사용된다.)
 
 ## 설치
 
 ```sh
 # 1) 로그 디렉토리 준비
-mkdir -p /Users/gyuyeong/dart-text2sql-wiki/data/logs
+mkdir -p /Users/gyuyeong/projects/dart-text2sql-wiki/data/logs
 
 # 2) LaunchAgents 로 복사 (또는 심볼릭 링크)
-cp /Users/gyuyeong/dart-text2sql-wiki/scripts/launchd/com.darttext.updateprices.plist \
+cp /Users/gyuyeong/projects/dart-text2sql-wiki/scripts/launchd/com.darttext.updateprices.plist \
    ~/Library/LaunchAgents/
-cp /Users/gyuyeong/dart-text2sql-wiki/scripts/launchd/com.darttext.updatefinancials.plist \
+cp /Users/gyuyeong/projects/dart-text2sql-wiki/scripts/launchd/com.darttext.updatefinancials.plist \
    ~/Library/LaunchAgents/
 
 # 3) 등록 (load)
@@ -50,8 +50,8 @@ launchctl start com.darttext.updatefinancials
 launchctl list | grep darttext
 
 # 로그 확인
-tail -f /Users/gyuyeong/dart-text2sql-wiki/data/logs/update_prices.log
-tail -f /Users/gyuyeong/dart-text2sql-wiki/data/logs/update_financials.log
+tail -f /Users/gyuyeong/projects/dart-text2sql-wiki/data/logs/update_prices.log
+tail -f /Users/gyuyeong/projects/dart-text2sql-wiki/data/logs/update_financials.log
 ```
 
 ## 누락일 메꿈 동작
@@ -68,7 +68,7 @@ tail -f /Users/gyuyeong/dart-text2sql-wiki/data/logs/update_financials.log
 ## 수동 실행 (디버그)
 
 ```sh
-cd /Users/gyuyeong/dart-text2sql-wiki
+cd /Users/gyuyeong/projects/dart-text2sql-wiki
 python3 scripts/update_prices.py
 python3 scripts/update_financials.py
 ```

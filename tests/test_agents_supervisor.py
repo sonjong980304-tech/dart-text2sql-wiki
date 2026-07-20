@@ -1332,7 +1332,7 @@ def test_verify_answer_single_domain_question_calls_llm_exactly_once():
     assert verdict["valid"] is True
 
 
-def test_domain_has_data_recognizes_multi_entity_kr_result_with_price():
+def test_verify_answer_accepts_multi_entity_kr_result_deterministic():
     """실제 버그 재현: entities 데이터가 있으면 llm_fn=None 결정론 경로에서 통과해야 한다."""
     domain_results = {
         "kr": {
