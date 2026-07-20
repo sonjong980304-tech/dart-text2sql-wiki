@@ -21,6 +21,7 @@ src/agents/data_price_kr.py). 이미 "한국주식 도메인"으로 라우팅된
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Any, Callable
 
 from src.agents.data_financial import _METRICS_TABLE_COLS, METRIC_SOURCE_MAP, resolve_metric
@@ -1280,6 +1281,51 @@ def _parse_recent_return_months(question: str) -> int | None:
     return None
 
 
+# ── 특정일자(연도 없는 월-일 포함) 시세 조회 (실서버 재현 버그) ──────────────────────
+# "하이닉스 6월 18일 주가정보"(연도 미명시)가 데이터가 있는 가장 오래된 연도(2015-06-18)를
+# 골라 답하던 버그를 고친다. _parse_period는 연도/분기만 인식해 "월-일"은 통째로 무시했고,
+# 정형 경로가 특정일자를 반영하지 못해 검증에 실패 → exec_fallback 자유코드로 새어
+# 날짜필터 없는 전체이력 조회 → 가장 오래된 행(2015)을 골랐다. domain_backtest의 "종료연도
+# 미명시 시 오늘이 속한 연도 기본값" 공통 규칙과 동일 원칙을 여기에도 적용한다: 연도가 없는
+# 월-일은 오늘이 속한 연도를 기본값으로 쓰고(연도가 명시됐으면 그 연도), 실제 거래일 폴백은
+# get_latest_price_kr의 "date <= asof 중 최신"이 자연히 담당한다(미래/휴장일이면 그 시점
+# 이하 가장 가까운 과거 거래일).
+#
+# "N월 D일" 형태만 특정일자로 본다("D일"이 반드시 있어야 함) — "6월 매출"(월만)이나
+# "3개월"(개월, '월' 앞이 숫자가 아님)에는 매치되지 않는다(오탐 방지).
+_MONTH_DAY_RE = re.compile(r"(?<!\d)(\d{1,2})\s*월\s*(\d{1,2})\s*일")
+
+
+def _parse_price_target_date(question: str, today: date | None = None) -> str | None:
+    """질문에서 "특정일자(연도 없는 월-일 포함)"를 'YYYY-MM-DD' 문자열로 파싱한다. 없으면 None.
+
+    - "6월 18일"(연도 미명시) → 오늘이 속한 연도의 6월 18일(domain_backtest의 "오늘이 속한
+      연도 기본값" 규칙과 동일). 그 시점 이하 가장 가까운 과거 거래일 폴백은 조회 단계
+      (get_latest_price_kr, date<=asof)가 담당하므로 여기서는 달력 날짜만 만든다.
+    - "2025년 6월 18일" / "25년 6월 18일"(연도 명시) → 그 연도의 6월 18일.
+    - "월-일"이 없으면(순수 시세 "주가 알려줘" 등) None → 호출부가 기존 최신값 경로 유지.
+    - 존재하지 않는 날짜(예: 2월 30일)는 None(달력 검증).
+
+    호출부는 재시도 피드백이 섞이지 않도록 _strip_retry_feedback을 거친 원본 질문을 넘긴다.
+    """
+    q = question or ""
+    m = _MONTH_DAY_RE.search(q)
+    if m is None:
+        return None
+    month, day = int(m.group(1)), int(m.group(2))
+    today = today or date.today()
+    ym = _YEAR_FULL_RE.search(q)
+    if ym:
+        year = int(ym.group(1))
+    else:
+        ys = _YEAR_SHORT_RE.search(q)
+        year = 2000 + int(ys.group(1)) if ys else today.year
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None  # 존재하지 않는 날짜(2월 30일 등)
+
+
 # ── 주가 시계열(price_history) 첨부 (버그A) ───────────────────────────────────
 # "최근 1년 주가 그래프"처럼 시계열/차트를 원하는 단일종목 가격 질문은, 단일 시점 스냅샷만
 # 담아 보내면 검증기(verify_answer)가 "1년 기간을 충족 못 함"이라며 정당하게 반려한다.
@@ -1565,6 +1611,7 @@ def _answer_kr_multi_entity_question(
     indicators: list[dict] | None,
     computed_metric_fn: Callable,
     price_return_fn: Callable,
+    today: date | None = None,
 ) -> dict:
     """한 질문이 이름으로 지목한 여러 종목(예: "삼성전자와 SK하이닉스 종가") 각각에 답한다.
 
@@ -1656,6 +1703,11 @@ def _answer_kr_multi_entity_question(
             # 수정. period가 None이면 asof=None → get_price_snapshot_kr 기존 최신값 경로.
             # technical 이면 active_indicators 가 채워져 지표까지 계산되고, 순수 시세면 None.
             price_asof = _resolve_screening_asof(period, conn, "prices", execute_sql_fn)
+            # "6월 18일" 특정일자(연도 없는 월-일 포함) 지목 시 그 날짜를 asof로 우선한다
+            # (단일종목 경로와 동일 — 연도 미명시면 오늘이 속한 연도 기본값).
+            target_date = _parse_price_target_date(base_question, today=today)
+            if target_date is not None:
+                price_asof = target_date
             price, err = _call_with_retry(
                 lambda c=code: price_snapshot_fn(
                     conn, c, asof=price_asof, indicators=active_indicators
@@ -1816,6 +1868,7 @@ def answer_kr_question(
     price_history_fn: Callable | None = None,
     price_return_fn: Callable | None = None,
     on_progress: Callable[..., None] | None = None,
+    today: date | None = None,
 ) -> dict:
     """한국주식 도메인 에이전트 진입점.
 
@@ -1887,6 +1940,7 @@ def answer_kr_question(
             resolve_metric_fn=resolve_metric_fn, price_snapshot_fn=price_snapshot_fn,
             execute_sql_fn=execute_sql_fn, indicators=indicators,
             computed_metric_fn=computed_metric_fn, price_return_fn=price_return_fn,
+            today=today,
         )
 
     stock_code = find_stock_code(conn, question, execute_sql_fn=execute_sql_fn)
@@ -1967,6 +2021,12 @@ def answer_kr_question(
         # 기준시점이 뒤섞이던 버그 수정). period가 None이면 asof=None → 기존 최신값 경로.
         # technical 이면 active_indicators 가 채워져 지표까지 계산되고, 순수 시세면 None.
         price_asof = _resolve_screening_asof(period, conn, "prices", execute_sql_fn)
+        # "6월 18일"처럼 특정일자(연도 없는 월-일 포함)를 지목하면 그 날짜를 asof로 쓴다
+        # (연도 미명시 시 오늘이 속한 연도 기본값). period 기반 asof(연간=말일)보다 우선한다 —
+        # get_price_snapshot_kr의 date<=asof가 그 시점 이하 가장 가까운 과거 거래일을 고른다.
+        target_date = _parse_price_target_date(base_question, today=today)
+        if target_date is not None:
+            price_asof = target_date
         price, err = _call_with_retry(
             lambda: price_snapshot_fn(
                 conn, stock_code, asof=price_asof, indicators=active_indicators

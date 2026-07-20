@@ -10,6 +10,8 @@
 """
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from src.agents.domain_kr import (
@@ -17,6 +19,7 @@ from src.agents.domain_kr import (
     _extract_metric,
     _parse_period,
     _parse_periods,
+    _parse_price_target_date,
     _parse_recent_return_months,
     _strip_retry_feedback,
     answer_kr_question,
@@ -1860,3 +1863,124 @@ def test_answer_kr_question_multi_entity_metrics_col_past_period_falls_back(tmp_
     by_code = {e["stock_code"]: e for e in result["entities"]}
     assert by_code["005930"]["financial"]["value"] == 9.9
     assert by_code["000660"]["financial"]["value"] == 7.7
+
+
+# ── 특정일자(연도 없는 월-일) 시세 조회 — 실서버 재현 버그 ─────────────────────────
+# "하이닉스 6월 18일 주가정보"(연도 미명시)가 데이터가 있는 가장 오래된 연도(2015-06-18)를
+# 골라버리던 버그. domain_backtest의 "종료연도 미명시 시 오늘이 속한 연도 기본값" 패턴과 동일
+# 원칙: 연도가 없는 월-일은 오늘이 속한 연도를 우선 쓰고, 그 시점 이하 가장 가까운 과거
+# 거래일 종가로 폴백한다(오래된 과거 연도를 임의로 고르지 않는다).
+def test_parse_price_target_date_no_year_uses_current_year():
+    assert _parse_price_target_date(
+        "하이닉스 6월 18일 주가정보 알려줘", today=date(2026, 7, 20)
+    ) == "2026-06-18"
+
+
+def test_parse_price_target_date_explicit_four_digit_year():
+    assert _parse_price_target_date(
+        "삼성전자 2025년 6월 18일 종가", today=date(2026, 7, 20)
+    ) == "2025-06-18"
+
+
+def test_parse_price_target_date_explicit_two_digit_year():
+    assert _parse_price_target_date(
+        "삼성전자 25년 6월 18일 종가", today=date(2026, 7, 20)
+    ) == "2025-06-18"
+
+
+def test_parse_price_target_date_none_when_no_month_day():
+    assert _parse_price_target_date("삼성전자 주가 알려줘", today=date(2026, 7, 20)) is None
+
+
+def test_parse_price_target_date_ignores_relative_months():
+    # "최근 3개월"은 특정 월-일이 아니다(개월 표현을 월-일로 오탐하지 않음).
+    assert _parse_price_target_date(
+        "삼성전자 최근 3개월 수익률", today=date(2026, 7, 20)
+    ) is None
+
+
+def test_parse_price_target_date_invalid_calendar_date_is_none():
+    # 존재하지 않는 날짜(2월 30일)는 None(달력 검증).
+    assert _parse_price_target_date(
+        "삼성전자 2월 30일 종가", today=date(2026, 7, 20)
+    ) is None
+
+
+def _seed_price_dates(tmp_path, code: str, name: str, rows: list[tuple[str, float]]) -> str:
+    """단일종목의 (date, close) 여러 건을 시드한 임시 DB 경로를 반환(특정일자 조회 테스트용)."""
+    db = tmp_path / "price_dates.db"
+    init_db(str(db))
+    conn = connect(str(db))
+    try:
+        conn.execute(
+            "INSERT INTO company(stock_code, name, market, sector) VALUES(?,?,?,?)",
+            (code, name, "KOSPI", "반도체"),
+        )
+        for d, close in rows:
+            conn.execute(
+                "INSERT INTO prices(stock_code, date, close, market_cap, open, high, low, volume) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (code, d, close, 1.5e14, close, close, close, 1.0e6),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return str(db)
+
+
+def test_answer_kr_question_month_day_without_year_uses_current_year_not_oldest(tmp_path):
+    """'하이닉스 6월 18일 주가정보'(연도 미명시) → 2015(가장 오래된 연도)가 아니라 오늘이
+    속한 연도(2026) 6월 18일 종가를 반환한다. 정형 경로에서 1차 시도로 성공해야 한다."""
+    db = _seed_price_dates(
+        tmp_path, "000660", "SK하이닉스",
+        [("2015-06-18", 44900.0), ("2026-06-18", 210000.0), ("2026-07-15", 230000.0)],
+    )
+    conn = connect_readonly(db)
+    try:
+        result = answer_kr_question(
+            "하이닉스 6월 18일 주가정보 알려줘", conn, today=date(2026, 7, 20),
+        )
+    finally:
+        conn.close()
+
+    assert result["stock_code"] == "000660"
+    assert result["intent"] == ("price",)
+    assert result["price"][0]["date"] == "2026-06-18"  # 2015-06-18이 아님
+    assert result["price"][0]["close"] == 210000.0
+    assert result["data_asof"]["price_date"] == "2026-06-18"
+    assert result["errors"] == []
+
+
+def test_answer_kr_question_month_day_falls_back_to_nearest_past_trading_day(tmp_path):
+    """월-일이 휴장일/미래여서 그날 데이터가 없으면 그 시점 이하 가장 가까운 과거 거래일로 폴백한다."""
+    db = _seed_price_dates(
+        tmp_path, "000660", "SK하이닉스",
+        [("2026-06-17", 200000.0), ("2026-06-19", 205000.0)],  # 6/18 거래 없음
+    )
+    conn = connect_readonly(db)
+    try:
+        result = answer_kr_question(
+            "하이닉스 6월 18일 종가", conn, today=date(2026, 7, 20),
+        )
+    finally:
+        conn.close()
+
+    assert result["price"][0]["date"] == "2026-06-17"  # 6/18 없음 → 직전 거래일
+
+
+def test_answer_kr_question_month_day_explicit_year_uses_that_year(tmp_path):
+    """'2025년 6월 18일'처럼 연도가 명시되면 그 해의 6월 18일을 쓴다(연간 말일 폴백 아님)."""
+    db = _seed_price_dates(
+        tmp_path, "000660", "SK하이닉스",
+        [("2025-06-18", 180000.0), ("2025-12-30", 195000.0), ("2026-06-18", 210000.0)],
+    )
+    conn = connect_readonly(db)
+    try:
+        result = answer_kr_question(
+            "SK하이닉스 2025년 6월 18일 종가", conn, today=date(2026, 7, 20),
+        )
+    finally:
+        conn.close()
+
+    assert result["price"][0]["date"] == "2025-06-18"  # 2025년 말일(12-30)이 아님
+    assert result["price"][0]["close"] == 180000.0
