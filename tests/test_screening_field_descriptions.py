@@ -36,6 +36,9 @@ _META_FIELDS = {
     # (매출총이익/매출원가)이 없어 항등식(매출액=매출원가+매출총이익)으로 유도했는지를 알린다.
     # 지표가 아니므로 METRIC_FIELD_DESCRIPTIONS에는 넣지 않는다.
     "gross_margin_estimated", "cogs_ratio_estimated",
+    # is_admin은 관리종목 여부를 나타내는 엔진 내부 필터링 전용 플래그(select_stocks가
+    # 신규매수 제한 판단에 쓴다) — 사용자에게 노출하는 스크리닝 "지표"가 아니다.
+    "is_admin",
 }
 
 

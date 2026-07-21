@@ -78,7 +78,8 @@ def _validate_criteria_keys(rows: list[dict], criteria: list[dict]) -> None:
         )
 
 
-def _filter_valid(rows: list[dict], criteria: list[dict], sectors=None, markets=None) -> list[dict]:
+def _filter_valid(rows: list[dict], criteria: list[dict], sectors=None, markets=None,
+                  held_codes=None) -> list[dict]:
     _validate_criteria_keys(rows, criteria)
     keys = [c["key"] for c in criteria]
     out = []
@@ -86,6 +87,11 @@ def _filter_valid(rows: list[dict], criteria: list[dict], sectors=None, markets=
         if sectors and r.get("sector") not in sectors:
             continue
         if markets and r.get("market") not in markets:  # 시장(KOSPI/KOSDAQ) 필터
+            continue
+        # 관리종목(is_admin)은 완전 배제하지 않고 신규매수만 막는다 — held_codes(직전 보유
+        # 종목 집합)에 없으면 이번엔 "신규매수 시도"이므로 후보에서 제외. held_codes=None
+        # (미지정)이면 필터링하지 않아 기존 동작과 100% 동일하다(회귀 없음).
+        if held_codes is not None and r.get("is_admin") and r["stock_code"] not in held_codes:
             continue
         if any(r.get(k) is None for k in keys):
             continue
@@ -117,6 +123,7 @@ def select_stocks(
     sector_neutral: bool = False,
     winsorize_z: float | None = None,
     winsorize_pct: float | None = None,
+    held_codes=None,
 ) -> list[dict]:
     """선정된 종목 리스트(점수 우수순)를 반환. markets=['KOSPI','KOSDAQ'] 또는 None(전체).
 
@@ -140,8 +147,12 @@ def select_stocks(
     pct"를 자르므로 분포 모양·표본 크기에 덜 민감하다. None(기본값)이면 미적용(회귀 없음).
     winsorize_z와 winsorize_pct는 독립적이며 둘 다 줄 수도 있다(원본값 퍼센타일 클리핑 →
     표준화 → z-score 시그마 클리핑 순으로 적용).
+
+    held_codes(선택): 직전 리밸런싱 시점에 이미 보유하고 있던 종목코드 집합. 관리종목
+    (row의 is_admin=True)은 held_codes에 없으면(신규매수 시도) 후보에서 제외하고, 있으면
+    (기존 보유 유지) 그대로 둔다. None(기본값)이면 이 필터를 적용하지 않는다(회귀 없음).
     """
-    valid = _filter_valid(rows, criteria, sectors, markets)
+    valid = _filter_valid(rows, criteria, sectors, markets, held_codes)
     if not valid or not criteria:
         return []
 

@@ -62,7 +62,8 @@ def run_backtest(
         t, t_next = rebalance_dates[i], rebalance_dates[i + 1]
         rows = metrics_fn(t)
         selected = select_stocks(rows, criteria, combine, n, sectors, markets,
-                                 winsorize_z=winsorize_z, winsorize_pct=winsorize_pct)
+                                 winsorize_z=winsorize_z, winsorize_pct=winsorize_pct,
+                                 held_codes=prev_codes)
         codes = [r["stock_code"] for r in selected]
         holdings_log.append({"date": t, "codes": codes})
         if not codes:

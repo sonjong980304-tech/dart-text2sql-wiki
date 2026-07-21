@@ -13,9 +13,11 @@ import sqlite3
 import pytest
 
 from src.backtest.data_access import (
+    _admin_halt_status_at,
     _is_alive,
     _months_before,
     _one_year_before,
+    metrics_at,
     mode_financial_quarter_at,
     momentum_12_1,
     momentum_12_1_batch,
@@ -76,6 +78,109 @@ def test_is_alive_true_when_delisting_date_is_null(tmp_path):
     )
     conn.commit()
     assert _is_alive(conn, "999999", "2026-01-01") is True
+
+
+# ── _admin_halt_status_at(): 관리종목/매매거래정지 열린 구간 판정 ─────────────────
+
+def _seed_admin_status(conn, code: str, status_type: str, start: str, end: str | None) -> None:
+    conn.execute(
+        "INSERT INTO kr_admin_status_history(stock_code, status_type, start_date, end_date) "
+        "VALUES (?,?,?,?)",
+        (code, status_type, start, end),
+    )
+    conn.commit()
+
+
+def test_admin_halt_status_at_returns_admin_when_open_interval(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_admin_status(conn, "023440", "admin", "2024-02-29", None)
+    assert _admin_halt_status_at(conn, "023440", "2024-06-01") == "admin"
+
+
+def test_admin_halt_status_at_returns_halt_when_open_interval(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_admin_status(conn, "023440", "halt", "2024-02-29", None)
+    assert _admin_halt_status_at(conn, "023440", "2024-06-01") == "halt"
+
+
+def test_admin_halt_status_at_none_outside_interval(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_admin_status(conn, "023440", "admin", "2024-02-29", "2024-05-01")
+    assert _admin_halt_status_at(conn, "023440", "2024-06-01") is None  # 해제 이후
+    assert _admin_halt_status_at(conn, "023440", "2024-01-01") is None  # 지정 이전
+
+
+def test_admin_halt_status_at_none_when_no_history(tmp_path):
+    conn = _conn(tmp_path)
+    assert _admin_halt_status_at(conn, "005930", "2024-06-01") is None
+
+
+def test_admin_halt_status_at_prefers_halt_when_both_open(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_admin_status(conn, "023440", "admin", "2024-01-01", None)
+    _seed_admin_status(conn, "023440", "halt", "2024-03-01", None)
+    assert _admin_halt_status_at(conn, "023440", "2024-06-01") == "halt"
+
+
+# ── metrics_at(): 관리종목/매매거래정지 연동 ─────────────────────────────────────
+
+def _seed_screenable(conn, code, quarter="2025Q1", disclosed="2025-05-15"):
+    """metrics_at()이 결과 행을 만들어낼 수 있게 최소 company+financials+prices를 채운다."""
+    conn.execute(
+        "INSERT INTO company(stock_code, name, market, sector) VALUES (?,?,?,?)",
+        (code, f"종목{code}", "KOSPI", "전기·전자"),
+    )
+    conn.execute(
+        "INSERT INTO financials(stock_code, quarter, disclosed_date, account_key, amount) "
+        "VALUES (?,?,?,?,?)",
+        (code, quarter, disclosed, "net_income", 1_000.0),
+    )
+    conn.execute(
+        "INSERT INTO financials(stock_code, quarter, disclosed_date, account_key, amount) "
+        "VALUES (?,?,?,?,?)",
+        (code, quarter, disclosed, "total_equity", 100_000.0),
+    )
+    conn.execute(
+        "INSERT INTO prices(stock_code, date, close, market_cap) VALUES (?,?,?,?)",
+        (code, "2025-06-30", 10_000.0, 1e12),
+    )
+    conn.commit()
+
+
+def test_metrics_at_excludes_halt_stock_entirely(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_screenable(conn, "000001")
+    _seed_screenable(conn, "000002")
+    _seed_admin_status(conn, "000002", "halt", "2025-06-01", None)
+
+    rows = metrics_at(conn, "2025-06-30")
+    codes = {r["stock_code"] for r in rows}
+    assert "000001" in codes
+    assert "000002" not in codes  # 거래정지 구간 → 완전 제외
+
+
+def test_metrics_at_keeps_admin_stock_but_flags_is_admin(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_screenable(conn, "000001")
+    _seed_screenable(conn, "000002")
+    _seed_admin_status(conn, "000002", "admin", "2025-06-01", None)
+
+    rows = metrics_at(conn, "2025-06-30")
+    by_code = {r["stock_code"]: r for r in rows}
+    assert "000002" in by_code  # 관리종목은 완전 배제하지 않음
+    assert by_code["000002"]["is_admin"] is True
+    assert by_code["000001"]["is_admin"] is False  # 정상 종목은 False(회귀 방지)
+
+
+def test_metrics_at_outside_admin_interval_is_not_flagged(tmp_path):
+    """구간 밖(해제 이후)이면 정상 종목처럼 is_admin=False여야 한다."""
+    conn = _conn(tmp_path)
+    _seed_screenable(conn, "000002")
+    _seed_admin_status(conn, "000002", "admin", "2024-01-01", "2024-06-01")  # 이미 해제됨
+
+    rows = metrics_at(conn, "2025-06-30")
+    by_code = {r["stock_code"]: r for r in rows}
+    assert by_code["000002"]["is_admin"] is False
 
 
 # ── _months_before(): _one_year_before의 임의 개월수 일반화 ─────────────────────

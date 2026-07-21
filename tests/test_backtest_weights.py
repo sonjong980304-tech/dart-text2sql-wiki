@@ -62,6 +62,44 @@ def test_backward_compat_criteria_mode_unaffected():
     assert len(res["dates"]) == 3
 
 
+def test_engine_excludes_newly_admin_stock_from_first_rebalance():
+    """관리종목이 최초 리밸런싱(직전 보유 없음)에서는 1위여도 신규매수로 제외돼야 한다."""
+    rows = [
+        {"stock_code": "A", "sector": "화학", "market": "KOSPI", "per": 1.0, "is_admin": True},
+        {"stock_code": "B", "sector": "화학", "market": "KOSPI", "per": 5.0, "is_admin": False},
+    ]
+    res = run_backtest(
+        _DATES, metrics_fn=lambda d: rows, price_fn=lambda d, c: 100.0,
+        params={"criteria": [{"key": "per", "direction": "low", "weight": 1.0}], "n": 1,
+                "fee_rate": 0.0, "tax_rate": 0.0, "slippage_rate": 0.0},
+    )
+    assert res["holdings"][0]["codes"] == ["B"]  # A(관리종목, per 1위)는 신규매수라 제외됨
+
+
+def test_engine_keeps_admin_stock_held_from_previous_rebalance():
+    """직전 리밸런싱에 보유했던 종목이 이후 관리종목이 돼도, 더 우수한 신규 관리종목
+    후보(E)보다 우선해 계속 선정돼야 한다 — engine이 prev_codes를 실제로 select_stocks에
+    넘기지 않으면(버그) E가 admin 여부와 무관하게 최우수라 그냥 선정돼 이 테스트가 실패한다.
+    """
+    rows_t0 = [
+        {"stock_code": "A", "sector": "화학", "market": "KOSPI", "per": 1.0, "is_admin": False},
+        {"stock_code": "C", "sector": "화학", "market": "KOSPI", "per": 5.0, "is_admin": False},
+    ]
+    rows_t1 = [
+        {"stock_code": "A", "sector": "화학", "market": "KOSPI", "per": 1.0, "is_admin": True},
+        # E는 A보다도 더 우수(per 낮음)한 신규 관리종목 후보 — 직전 보유가 아니므로 제외돼야 함.
+        {"stock_code": "E", "sector": "화학", "market": "KOSPI", "per": 0.5, "is_admin": True},
+    ]
+    rows_by_date = {_DATES[0]: rows_t0, _DATES[1]: rows_t1, _DATES[2]: rows_t1}
+    res = run_backtest(
+        _DATES, metrics_fn=lambda d: rows_by_date[d], price_fn=lambda d, c: 100.0,
+        params={"criteria": [{"key": "per", "direction": "low", "weight": 1.0}], "n": 1,
+                "fee_rate": 0.0, "tax_rate": 0.0, "slippage_rate": 0.0},
+    )
+    assert res["holdings"][0]["codes"] == ["A"]  # t0: 정상종목으로 선정
+    assert res["holdings"][1]["codes"] == ["A"]  # t1: E(신규 관리종목)보다 우선해 직전 보유 A 유지
+
+
 def test_engine_forwards_winsorize_z_param_to_select_stocks():
     """params["winsorize_z"]가 select_stocks까지 배선돼 선정 종목이 바뀌는지 검증(엔진 배선).
 

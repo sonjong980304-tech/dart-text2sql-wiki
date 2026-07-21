@@ -45,6 +45,37 @@ def test_check_survivorship_blocks_when_holding_delisted_before_asof(tmp_path):
     assert v["reason"]  # 사유 텍스트가 존재
 
 
+def test_check_survivorship_blocks_when_holding_halted_stock(tmp_path):
+    """매매거래정지 구간의 종목이 보유에 있으면 상장폐지와 동일하게 하드차단해야 한다."""
+    conn = _seeded_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO kr_admin_status_history(stock_code, status_type, start_date, end_date) "
+        "VALUES (?,?,?,?)",
+        ("000002", "halt", "2025-06-01", None),
+    )
+    conn.commit()
+    holdings = [{"date": "2025-12-31", "codes": ["000001", "000002"]}]
+    v = auditor.check_survivorship(conn, holdings)
+    assert v["blocked"] is True
+    assert any(e["stock_code"] == "000002" for e in v["evidence"])
+
+
+def test_check_survivorship_does_not_block_admin_only_stock(tmp_path):
+    """관리종목(halt 아님)은 매매 자체는 가능하므로 이 하드차단 대상이 아니다
+    (신규매수 제한은 select_stocks 단계에서 이미 처리됨)."""
+    conn = _seeded_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO kr_admin_status_history(stock_code, status_type, start_date, end_date) "
+        "VALUES (?,?,?,?)",
+        ("000002", "admin", "2025-06-01", None),
+    )
+    conn.commit()
+    holdings = [{"date": "2025-12-31", "codes": ["000001", "000002"]}]
+    v = auditor.check_survivorship(conn, holdings)
+    assert v["blocked"] is False
+    assert v["evidence"] == []
+
+
 def test_check_survivorship_kr_market_stays_bool_semantics(tmp_path):
     # KR(기본)은 기존 bool 판정 그대로 — 검증불가 플래그가 붙지 않는다(회귀 방지).
     conn = _seeded_conn(tmp_path)

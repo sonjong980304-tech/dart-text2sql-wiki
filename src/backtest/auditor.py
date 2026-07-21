@@ -30,7 +30,7 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Callable
 
 from ..llm import extract_json
-from .data_access import _is_alive, effective_quarter_at
+from .data_access import _admin_halt_status_at, _is_alive, effective_quarter_at
 from .pipeline_exec import MAX_TIMEOUT  # 새 상수 만들지 않고 기존 타임아웃 상한 재사용
 
 
@@ -38,20 +38,26 @@ from .pipeline_exec import MAX_TIMEOUT  # 새 상수 만들지 않고 기존 타
 # 하드차단 검사 3종 (LLM 없음 · 결정론적)
 # ==========================================================================
 def check_survivorship(conn, holdings: list[dict], is_alive_fn: Callable | None = None,
-                       market: str = "KR") -> dict:
-    """① 생존편향 하드차단: 보유종목 중 그 시점 기준 이미 상장폐지된 종목이 있으면 차단한다.
+                       market: str = "KR", admin_halt_status_fn: Callable | None = None) -> dict:
+    """① 생존편향 하드차단: 보유종목 중 그 시점 기준 이미 상장폐지됐거나 매매거래정지
+    상태였던 종목이 있으면 차단한다.
 
     각 리밸런싱 시점(holdings의 date=asof)에 보유한 종목이 그 시점에 실제로 살아있었는지를
     상장폐지 테이블로 재검증한다. 정상 경로에서는 metrics_at의 _is_alive가
     이미 죽은 종목을 걸러내므로 사실상 항상 통과한다 — 이 함수는 그 가드가 회귀로 깨졌을 때를
-    잡는 **방어적 이중화 안전망**이다(스펙 §3.2 ①). 위반이 하나라도 있으면 blocked=True로
-    사유·증거(종목코드)를 반환.
+    잡는 **방어적 이중화 안전망**이다(스펙 §3.2 ①). 매매거래정지(halt)도 그 구간엔 실제로
+    거래가 불가능했다는 점에서 본질이 같으므로 같은 하드차단으로 함께 검사한다(관리종목
+    admin은 매매 자체는 가능하므로 대상이 아니다 — 신규매수 제한은 select_stocks가 이미
+    처리했다). 위반이 하나라도 있으면 blocked=True로 사유·증거(종목코드)를 반환.
 
-    기본 판정 함수는 data_access._is_alive(delisting 테이블)이다(bool 반환).
-    is_alive_fn을 명시 주입하면 그것을 우선한다(테스트 주입용).
+    기본 판정 함수는 data_access._is_alive(delisting 테이블)/_admin_halt_status_at
+    (kr_admin_status_history 테이블)이다. is_alive_fn/admin_halt_status_fn을 명시
+    주입하면 그것을 우선한다(테스트 주입용).
     """
     if is_alive_fn is None:
         is_alive_fn = _is_alive
+    if admin_halt_status_fn is None:
+        admin_halt_status_fn = _admin_halt_status_at
     evidence = []
     for h in holdings or []:
         if not isinstance(h, dict):
@@ -65,9 +71,11 @@ def check_survivorship(conn, holdings: list[dict], is_alive_fn: Callable | None 
         for code in h.get("codes", []) or []:
             if not is_alive_fn(conn, code, asof):
                 evidence.append({"stock_code": code, "asof": asof})
+            elif admin_halt_status_fn(conn, code, asof) == "halt":
+                evidence.append({"stock_code": code, "asof": asof})
     blocked = bool(evidence)
     reason = (
-        f"상장폐지된 종목이 백테스트 보유에 포함됨(생존편향): {len(evidence)}건"
+        f"상장폐지 또는 매매거래정지된 종목이 백테스트 보유에 포함됨(생존편향): {len(evidence)}건"
         if blocked else ""
     )
     return {"sin": "survivorship", "blocked": blocked, "reason": reason, "evidence": evidence}

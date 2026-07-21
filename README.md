@@ -415,7 +415,7 @@ LLM이 만든 신뢰할 수 없는 코드가 그 프로세스나 데이터베이
 ### 2. 관리종목·거래정지 이력 (`kr_trading_status` + `kr_admin_status_history`)
 - **무엇**: 두 소스를 병행합니다 — (a) `kr_trading_status`(`src/ingest/kr_trading_status.py`)는 KRX가 주는 '오늘 현재' 스냅샷을 매일 직전 스냅샷과 diff해 지정~해제 구간을 **앞으로** 누적하고, (b) `kr_admin_status_history`(`src/ingest/kr_admin_status_history.py`)는 DART OpenDART 공시목록(과거 조회 지원)으로 **과거 구간을 소급 복원**합니다.
 - **왜**: KRX 스냅샷만으로는 관측 이후 미래 구간만 쌓여, 과거 백테스트 시점에 그 종목이 관리종목·거래정지였는지를 알 수 없습니다.
-- **어떻게**: `classify_disclosure`가 공시 제목(report_nm)을 분류하고 `build_status_intervals`가 방향이 확실한 공시만 지정~해제 구간으로 만듭니다. 코스피 "매매거래정지및정지해제"처럼 제목만으로 정지/해제 방향을 알 수 없는 결합형·기간변경·모호 공시는 구간으로 만들지 않고 `review`로 분리해 추측성 오분류를 피합니다(DART 공시만으로는 전 종목을 못 덮으므로 실측 커버리지 약 77%, 한계를 있는 그대로 남깁니다). 소스가 완전히 달라(KRX 스냅샷 vs DART 공시) 두 테이블을 별도로 두며, 데이터 품질 검증 전이라 이번 스코프에서는 백테스트 look-ahead 경로에 배선하지 않았습니다.
+- **어떻게**: `classify_disclosure`가 공시 제목(report_nm)을 분류하고 `build_status_intervals`가 방향이 확실한 공시만 지정~해제 구간으로 만듭니다. 코스피 "매매거래정지및정지해제"처럼 제목만으로 정지/해제 방향을 알 수 없는 결합형·기간변경·모호 공시는 구간으로 만들지 않고 `review`로 분리해 추측성 오분류를 피합니다(DART 공시만으로는 전 종목을 못 덮으므로 실측 커버리지 약 77%, 한계를 있는 그대로 남깁니다). 소스가 완전히 달라(KRX 스냅샷 vs DART 공시) 두 테이블을 별도로 두되, `kr_admin_status_history`(과거 구간 복원분)는 백테스트 look-ahead 경로에 배선했습니다: `data_access._admin_halt_status_at`이 그 시점(asof)에 열린 구간을 조회해, 매매거래정지(halt)는 상장폐지와 동일하게 `metrics_at`/`check_survivorship`에서 완전 하드차단하고, 관리종목(admin)은 매매 자체는 가능하므로 완전 배제 대신 `select_stocks`에서 신규매수만 차단합니다(직전 리밸런싱에 이미 보유 중이었으면 계속 보유/매도는 허용).
 
 ### 3. 종목명·코드 변경이력 (`kr_stock_changes`)
 - **무엇/왜/어떻게**: 상장사가 사명·종목코드를 바꾸면 옛 이름으로는 검색이 끊깁니다. `kr_stock_changes`(`src/ingest/kr_stock_changes.py`)가 변경 전↔후를 연결해, 옛 사명으로 물어도 현재 종목으로 이어지게 합니다(pykrx 조회는 DI로 분리해 네트워크 없이 단위 테스트).

@@ -261,6 +261,23 @@ def _is_alive(conn, code: str, asof: str) -> bool:
     return True
 
 
+def _admin_halt_status_at(conn, code: str, asof: str) -> str | None:
+    """그 시점(asof)에 code가 관리종목('admin')이거나 매매거래정지('halt')면 해당
+    status_type, 둘 다 아니면 None. 두 상태가 동시에 열려있으면 halt(더 강한 제약)를 우선한다.
+    """
+    rows = conn.execute(
+        "SELECT status_type FROM kr_admin_status_history "
+        "WHERE stock_code=? AND start_date<=? AND (end_date IS NULL OR end_date>?)",
+        (code, asof, asof),
+    ).fetchall()
+    types = {r["status_type"] for r in rows}
+    if "halt" in types:
+        return "halt"
+    if "admin" in types:
+        return "admin"
+    return None
+
+
 # 스크리닝 LLM 프롬프트에 노출할 "재무/파생 지표" 필드의 단일 정의처(canonical source).
 # 새 지표를 추가할 때 metrics_at()의 반환 dict에 필드를 넣는 것과 함께 여기(key: 한글설명)만
 # 갱신하면, domain_kr.py의 _KR_SCREEN_FIELDS와 스크리닝 프롬프트(_screening_prompt)가
@@ -320,6 +337,12 @@ def metrics_at(conn, asof: str) -> list[dict]:
         code = c["stock_code"]
         name = c["name"]
         if not _is_alive(conn, code, asof):
+            continue
+        # 매매거래정지 구간은 실제로 거래 자체가 불가능하므로 delisting과 동일하게 완전
+        # 제외한다. 관리종목(admin)은 매매는 대부분 가능하므로 여기서 배제하지 않고
+        # is_admin 플래그만 남겨, 신규매수 제한 여부는 소비자(select_stocks)가 판단한다.
+        admin_halt_status = _admin_halt_status_at(conn, code, asof)
+        if admin_halt_status == "halt":
             continue
         # 스팩(기업인수목적회사)은 합병 전 현금성 자산 덩어리라 PER/ROE가 무의미 → 제외
         if "스팩" in name or "기업인수목적" in name:
@@ -520,6 +543,9 @@ def metrics_at(conn, asof: str) -> list[dict]:
         if is_equity_ratio_anomalous(conn, code, asof):
             for _k in ("per", "pbr", "psr", "pcr", "ev_ebitda", "peg", "earnings_yield"):
                 row[_k] = None
+        # 스크리닝 프롬프트에 노출하는 "재무지표"가 아니라 엔진 내부 필터링 전용 플래그다
+        # (select_stocks가 신규매수만 차단하기 위해 이 값을 쓴다).
+        row["is_admin"] = admin_halt_status == "admin"
         out.append(row)
     return out
 

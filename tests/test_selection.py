@@ -34,6 +34,48 @@ def test_select_stocks_still_selects_with_known_fields():
     assert [r["name"] for r in picked] == ["다", "가"]  # per 낮은 순 5<8
 
 
+# ── held_codes: 관리종목(is_admin)은 직전 보유가 아니면 신규매수 후보에서 제외 ──────
+
+def _fake_rows_with_admin():
+    """"다"(가장 저PER)가 관리종목으로 지정된 상황. per 오름차순 우선순위: 다(5) < 가(8) < 나(15)."""
+    return [
+        {"stock_code": "000001", "name": "가", "sector": "화학", "market": "KOSPI",
+         "quarter": "2025Q1", "per": 8.0, "roe": 12.0, "is_admin": False},
+        {"stock_code": "000002", "name": "나", "sector": "화학", "market": "KOSPI",
+         "quarter": "2025Q1", "per": 15.0, "roe": 8.0, "is_admin": False},
+        {"stock_code": "000003", "name": "다", "sector": "금융", "market": "KOSPI",
+         "quarter": "2025Q1", "per": 5.0, "roe": 20.0, "is_admin": True},
+    ]
+
+
+def test_select_stocks_excludes_admin_stock_not_held():
+    """관리종목("다")을 직전에 보유하지 않았으면(신규매수 시도) 1위여도 후보에서 빠진다."""
+    criteria = [{"key": "per", "direction": "low", "weight": 1.0}]
+    picked = select_stocks(_fake_rows_with_admin(), criteria, combine="zscore", n=2,
+                           held_codes=set())
+    assert "000003" not in {r["stock_code"] for r in picked}
+    assert [r["name"] for r in picked] == ["가", "나"]  # 다음 순위로 채워짐
+
+
+def test_select_stocks_keeps_admin_stock_when_already_held():
+    """관리종목("다")을 직전에 보유하고 있었으면(기존 보유 유지) 정상적으로 선정될 수 있다."""
+    criteria = [{"key": "per", "direction": "low", "weight": 1.0}]
+    picked = select_stocks(_fake_rows_with_admin(), criteria, combine="zscore", n=2,
+                           held_codes={"000003"})
+    assert [r["name"] for r in picked] == ["다", "가"]  # per 낮은 순 그대로(5<8)
+
+
+def test_select_stocks_default_held_codes_none_matches_old_behavior():
+    """held_codes를 안 주면(기본 None) 기존 동작과 100% 동일해야 한다(하위호환 회귀 방지)."""
+    criteria = [{"key": "per", "direction": "low", "weight": 1.0}]
+    with_none = select_stocks(_fake_rows_with_admin(), criteria, combine="zscore", n=2)
+    with_empty = select_stocks(_fake_rows_with_admin(), criteria, combine="zscore", n=2,
+                               held_codes=set())
+    # None(미지정)은 "필터링 없음"이므로 관리종목도 그대로 포함돼 결과가 달라야 한다.
+    assert [r["stock_code"] for r in with_none] != [r["stock_code"] for r in with_empty]
+    assert "000003" in {r["stock_code"] for r in with_none}
+
+
 def _us_rows_with_dual_class():
     """GOOG(Class C)/GOOGL(Class A)처럼 한 회사가 복수 티커로 상장된 상황 재현.
 
