@@ -1546,6 +1546,45 @@ def test_verify_answer_composite_domains_pass_when_combined_result_satisfies_que
     assert all(v["valid"] for v in verdict["per_domain"].values())
 
 
+def test_verify_prompt_explains_domains_need_not_each_fully_answer_alone():
+    """실서버 재현 버그: "코스피 전종목 PER을 z-score로 바꿔 10분위 히스토그램" 질문에서
+    backtest 도메인이 이미 z-score/분위/그래프까지 완전한 답을 냈는데도, 곁다리로 함께
+    라우팅된 kr(단순 정렬 목록만 가능)이 "혼자서는 질문 전체를 못 채운다"는 이유로 검증
+    LLM이 전체를 invalid로 오판했다 — 여러 도메인이 있을 때 "종합해서 이미 충족되면
+    된다"는 지침이 프롬프트에 없었기 때문이다. 이 지침을 명시해야 한다."""
+    prompt = supervisor_mod._verify_prompt(
+        "코스피 전종목 PER z-score 10분위 히스토그램",
+        {"kr": {}, "backtest": {}},
+    )
+    assert "종합" in prompt or "합쳐" in prompt
+    assert "개별적으로" in prompt or "혼자" in prompt
+
+
+def test_verify_answer_composite_domains_pass_when_one_domain_already_fully_answers():
+    """backtest가 이미 z-score/분위/그래프를 다 계산했으면, kr이 단순 목록만 추가로
+    제공해도 합산 검증에서 valid=true여야 한다(실서버 재현: 기존엔 이 경우 개별판정
+    AND 로직 때문에 kr이 "혼자서는 부족하다"고 잡혀 전체가 무효 처리됐다)."""
+    domain_results = {
+        "kr": {"result": [{"stock_code": "005930", "per": 10.0}]},
+        "backtest": {"blocked": False, "error": None,
+                     "result": {"hist": {"field": "per_neutral", "counts": [1, 2, 3]}}},
+    }
+    calls: list[str] = []
+
+    def fake_llm(prompt: str) -> str:
+        calls.append(prompt)
+        if "종합" in prompt or "합쳐" in prompt:
+            return '{"valid": true, "reason": "backtest에 이미 z-score/히스토그램이 있어 충족됨"}'
+        return '{"valid": false, "reason": "이 도메인 결과 혼자만으로는 부족"}'
+
+    verdict = verify_answer(
+        "코스피 전종목 PER z-score 10분위 히스토그램", domain_results, fake_llm,
+    )
+
+    assert verdict["valid"] is True
+    assert len(calls) == 1  # 합산 검증 1회로 끝남 — 도메인별 개별 호출로 안 샌다
+
+
 def test_verify_answer_composite_domains_falls_back_to_per_domain_when_combined_check_fails():
     """합산 검증이 실제로 실패하면(진짜 문제) 기존처럼 도메인별로 세분화해 원인을 특정한다."""
     domain_results = {

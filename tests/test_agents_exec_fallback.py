@@ -136,6 +136,52 @@ def test_python_prompt_omits_date_anchor_note_when_no_date_column():
     assert "기준일은 None" not in prompt
 
 
+# 실사용 재현: SQL이 market='KOSPI'(영문)로 이미 필터링한 rows를 넘겨받고도, Python
+# 프롬프트에 컬럼 "이름"(market)만 있고 실제 "값" 예시가 없어서 LLM이 재차 필터링을
+# 시도하며 market 값을 '코스피'(한글)라고 착각했다 — 실제로는 전혀 매치 안 되는 값이라
+# 결과가 통째로 0건이 됐다(count=0). 실제 값 형식을 샘플 몇 개로 보여줘야 이 착각을 막는다.
+def test_python_prompt_includes_sample_row_values_to_reveal_actual_value_formats():
+    sample_rows = [{"stock_code": "005930", "market": "KOSPI", "per": 10.5}]
+    prompt = _python_prompt("질문", ["stock_code", "market", "per"], 900, None, sample_rows=sample_rows)
+    assert "KOSPI" in prompt
+
+
+def test_python_prompt_omits_sample_rows_note_when_not_given():
+    # 기존 호출부(샘플 미지정)는 회귀 없이 그대로 동작해야 한다 — 새 파라미터는 선택적이다.
+    prompt = _python_prompt("질문", ["stock_code", "amount"], 10, None)
+    assert "질문:" in prompt
+
+
+def test_run_free_exec_fallback_passes_sample_rows_from_sql_result_into_python_prompt():
+    llm_fn = _fake_llm_sequence(
+        "```sql\nSELECT stock_code, market, per FROM metrics;\n```",
+        "```python\nresult = {'count': 1}\n```",
+    )
+    captured_prompts: list[str] = []
+
+    def capturing_llm(prompt):
+        captured_prompts.append(prompt)
+        return llm_fn(prompt)
+
+    def fake_execute_sql(sql, conn):
+        return {
+            "ok": True, "columns": ["stock_code", "market", "per"],
+            "rows": [{"stock_code": "005930", "market": "KOSPI", "per": 10.5}],
+            "row_count": 1, "error": None,
+        }
+
+    def fake_execute_python(code, context=None, result_var="result"):
+        return {"ok": True, "result": {"count": 1}, "error": None}
+
+    run_free_exec_fallback(
+        "코스피 종목 PER", conn=object(), llm_fn=capturing_llm,
+        execute_sql_fn=fake_execute_sql, execute_python_fn=fake_execute_python,
+    )
+
+    python_prompt = captured_prompts[1]  # [0]=SQL 프롬프트, [1]=Python 프롬프트
+    assert "KOSPI" in python_prompt
+
+
 def test_run_free_exec_fallback_passes_latest_date_from_rows_into_python_prompt():
     llm_fn = _fake_llm_sequence(
         "```sql\nSELECT date, close FROM prices;\n```",

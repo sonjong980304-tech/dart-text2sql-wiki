@@ -16,6 +16,7 @@ answer_with_verification(supervisor.py)의 재시도 루프(정확히 max_retrie
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Callable
 
@@ -24,6 +25,12 @@ from src.db import schema_catalog
 from src.llm import extract_sql
 
 _PY_CODE_FENCE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+
+# Python 프롬프트에 값 형식 예시로 보여줄 최대 샘플 행 수. 컬럼 "이름"만으로는 실제 값
+# 형식(예: market이 'KOSPI'인지 '코스피'인지)을 LLM이 알 수 없어 재차 필터링을 시도하다
+# 매칭이 하나도 안 되는 실패가 있었다(count=0) — 원본 rows 전체를 넣으면 프롬프트가
+# 다시 폭발하므로(_PROMPT_LIST_HEAD와 동일 원칙) 값 형식만 확인 가능한 소수만 보여준다.
+_SAMPLE_ROWS_LIMIT = 3
 
 
 def _is_meaningfully_empty(result) -> bool:
@@ -108,9 +115,19 @@ def _python_prompt(
     last_reason: str | None,
     code_error: str | None = None,
     latest_date: str | None = None,
+    sample_rows: list[dict] | None = None,
 ) -> str:
     reason_note = (
         f"\n\n정형 방식이 다음 이유로 반복 실패했습니다: {last_reason}" if last_reason else ""
+    )
+    sample_note = (
+        "\n실제 값 형식 예시(rows의 앞부분 일부): "
+        f"{json.dumps(sample_rows[:_SAMPLE_ROWS_LIMIT], ensure_ascii=False, default=str)}\n"
+        "컬럼 값의 실제 표기(예: 시장 구분이 영문 코드인지 한글인지, 날짜 형식 등)를 반드시 "
+        "이 예시 그대로 참고하세요 — 컬럼 이름만 보고 값 형식을 추측해 다시 필터링하면(예: "
+        "실제 값이 'KOSPI'인데 '코스피'로 필터링) 조건이 하나도 안 맞아 결과가 통째로 "
+        "비어버릴 수 있습니다."
+        if sample_rows else ""
     )
     retry_note = (
         f"\n\n[직전 코드 실행 실패] 방금 작성한 코드가 다음 이유로 실패했습니다: {code_error}\n"
@@ -135,7 +152,8 @@ def _python_prompt(
         "스러운 이름)이 위 실제 컬럼 목록에 그대로 없다면, 그건 원본에 저장돼 있지 않은 "
         "파생(계산) 값입니다 — account_name/account_key 같은 컬럼 안에서 그 이름을 문자열로 "
         "찾으려 하지 마세요(존재하지 않습니다). 대신 원본의 raw 항목들(예: 영업이익/매출/자산/"
-        f"부채/시가총액 등)을 pandas로 조합해 표준적인 계산식으로 직접 산출하세요.{date_note}\n"
+        f"부채/시가총액 등)을 pandas로 조합해 표준적인 계산식으로 직접 산출하세요.{date_note}"
+        f"{sample_note}\n"
         f"{reason_note}{retry_note}\n\n질문: {question}\nPython 코드:"
     )
 
@@ -198,7 +216,10 @@ def run_free_exec_fallback(
     code_error: str | None = None
     for _attempt in range(max_code_attempts):
         code_raw = llm_fn(
-            _python_prompt(question, columns, len(rows), last_reason, code_error, latest_date)
+            _python_prompt(
+                question, columns, len(rows), last_reason, code_error, latest_date,
+                sample_rows=rows[:_SAMPLE_ROWS_LIMIT],
+            )
         ) or ""
         code = _extract_python_code(code_raw)
         if not code:
