@@ -712,7 +712,7 @@ def api_allweather():
 class BacktestReq(BaseModel):
     domain: str = "kr"            # 'kr'(KOSPI/KOSDAQ). 기본 kr
     start_year: int = 2024
-    end_year: int = 2026
+    end_year: int = 2027
     rebalance: str = "quarterly"
     n: int = 10
     criteria: list = []           # [{"key","direction","weight"}]
