@@ -20,7 +20,7 @@ def save_nav_chart(dates, navs, path: str, benchmark=None, title: str = "백테�
     x = list(range(len(navs)))
     ax.plot(x, navs, label="Strategy", linewidth=1.8)
     if benchmark is not None and len(benchmark) == len(navs):
-        ax.plot(x, benchmark, label="Benchmark", linewidth=1.2, linestyle="--")
+        ax.plot(x, benchmark, label="KOSPI", linewidth=1.2, linestyle="--")
     # x축 라벨은 과밀 방지를 위해 최대 12개만 표시
     if dates:
         step = max(1, len(dates) // 12)

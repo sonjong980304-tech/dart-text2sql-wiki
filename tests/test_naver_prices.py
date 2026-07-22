@@ -57,6 +57,23 @@ def test_parse_fchart_xml_zero_ohlv_treated_as_missing_on_halt_day():
     }
 
 
+def test_parse_fchart_xml_decimal_values_for_index_symbol():
+    """symbol=KOSPI 같은 지수는 개별종목(원화 정수가)과 달리 소수점 있는 지수 포인트로
+    온다("1969.04" 등). int()로 파싱하면 ValueError로 죽던 버그(실측: 코스피 백필 중 발견)를
+    막는다 — float으로 받아야 개별종목·지수 양쪽 다 같은 파서로 처리할 수 있다."""
+    xml = """<?xml version="1.0" encoding="EUC-KR" ?>
+<protocol title="주식시세">
+<chartdata symbol="KOSPI" name="코스피" count="1">
+<item data="20140428|1969.04|1969.04|1969.04|1969.04|123456" />
+</chartdata>
+</protocol>"""
+    rows = parse_fchart_xml(xml)
+    assert rows == [
+        {"date": "2014-04-28", "open": 1969.04, "high": 1969.04, "low": 1969.04,
+         "close": 1969.04, "volume": 123456.0},
+    ]
+
+
 def test_parse_fchart_xml_empty_chartdata_returns_empty_list():
     xml = """<?xml version="1.0" encoding="EUC-KR" ?>
 <protocol title="주식시세">

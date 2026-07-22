@@ -75,24 +75,34 @@ def run_backtest_pytest_check() -> dict:
 def _fetch_kospi_1y_return(db_path: str) -> float:
     """격리 사본 DB에서 코스피 지수 최근 1년 실제 수익률(fraction)을 계산한다.
 
-    현재 prices 테이블은 개별 종목 OHLCV만 담고 코스피 지수 자체(가상 종목코드)는
-    수집 파이프라인이 없다(src/ingest/naver_prices.py, src/ingest/krx.py 모두 개별 종목
-    전용). 데이터가 없으면 ValueError를 던져 호출부가 pass=None, note="측정불가"로
-    기록하게 한다(예외를 여기서 삼키지 않는다 — 호출부가 명시적으로 처리).
+    prices 테이블의 stock_code='KOSPI'(scripts/backfill_kospi_index.py로 최초 적재,
+    src/ingest/naver_prices.py가 개별종목과 동일한 방식으로 일일 갱신)의 최신 종가와,
+    거기서 정확히 12개월 전 시점(date<=t 최근값, look-ahead 없음)의 종가를 비교한다.
+    최신 종가와 데이터 전체의 첫 종가를 비교하면(예전 구현) 전체 이력(수년치) 누적
+    수익률이 나와 "1년" 이름과 실제 계산이 어긋나므로 12개월 전 기준을 명시적으로 구한다.
+    데이터가 없거나 12개월 전 시점 값이 아예 없으면(예: 백필 범위가 1년이 안 됨) ValueError를
+    던져 호출부가 pass=None, note="측정불가"로 기록하게 한다(예외를 여기서 삼키지 않는다).
     """
+    from ...backtest.data_access import _months_before
+
     conn = connect(db_path)
     try:
-        rows = conn.execute(
-            "SELECT date, close FROM prices WHERE stock_code = ? ORDER BY date",
+        latest = conn.execute(
+            "SELECT date, close FROM prices WHERE stock_code = ? ORDER BY date DESC LIMIT 1",
             (_KOSPI_PSEUDO_CODE,),
-        ).fetchall()
+        ).fetchone()
+        if not latest:
+            raise ValueError("prices 테이블에 코스피 지수 데이터가 없음(수집 파이프라인 미구축)")
+        one_year_ago = _months_before(latest["date"], 12)
+        base_row = conn.execute(
+            "SELECT close FROM prices WHERE stock_code = ? AND date <= ? ORDER BY date DESC LIMIT 1",
+            (_KOSPI_PSEUDO_CODE, one_year_ago),
+        ).fetchone()
     finally:
         conn.close()
-    if len(rows) < 2:
-        raise ValueError("prices 테이블에 코스피 지수 데이터가 없음(수집 파이프라인 미구축)")
-    first, last = rows[0]["close"], rows[-1]["close"]
+    first, last = (base_row["close"] if base_row else None), latest["close"]
     if not first:
-        raise ValueError("코스피 지수 시작값이 0/NULL이라 수익률을 계산할 수 없음")
+        raise ValueError("코스피 지수 1년 전 시점 데이터가 없어 수익률을 계산할 수 없음")
     return (last / first) - 1
 
 

@@ -569,22 +569,21 @@ def build_callbacks(conn):
 
 
 def build_benchmark_fn(dates: list[str], metrics_fn, price_fn):
-    """시장 동일가중 벤치마크 지수(레벨 시계열) 생성.
+    """실제 코스피 지수 벤치마크(레벨 시계열) 생성.
 
-    각 시점의 유니버스(가드를 통과한 거래종목 전체)를 동일가중 보유했을 때의 NAV.
-    전략 포트폴리오와 '같은 유니버스·같은 가격경로'를 쓰므로, 전략이 시장(동일가중)을
-    이겼는지 공정하게 비교할 수 있다. 첫 시점=1.0, 이후 구간 평균수익률을 누적한다.
+    prices 테이블의 stock_code='KOSPI'(네이버 fchart 지수 심볼 — 개별종목과 동일한 방식으로
+    수집, scripts/backfill_kospi_index.py 참고) 종가를 그대로 정규화해 쓴다. 예전엔 그 시점
+    유니버스를 동일가중 보유했을 때의 가상 NAV로 근사했으나, 실제 코스피 지수 자체와 직접
+    비교하도록 바꿨다. 첫 시점 종가를 1.0으로 놓고, 이후 각 시점 종가를 첫 시점 종가로 나눈
+    비율을 그대로 레벨로 쓴다(price_fn은 기존과 동일하게 date<=asof 최근 종가 원칙을 지켜
+    look-ahead가 없다). metrics_fn은 예전 동일가중 계산에 쓰였으나 지금은 쓰지 않는다 —
+    다른 benchmark_fn_factory 구현과 시그니처를 맞추려고 그대로 남겨둔다.
     """
-    levels = {dates[0]: 1.0}
-    cur = 1.0
-    for i in range(len(dates) - 1):
-        t, t1 = dates[i], dates[i + 1]
-        codes = [r["stock_code"] for r in metrics_fn(t)]
-        rets = []
-        for code in codes:
-            p0, p1 = price_fn(t, code), price_fn(t1, code)
-            if p0 and p1 and p0 > 0:
-                rets.append(p1 / p0 - 1)
-        cur *= (1 + (sum(rets) / len(rets) if rets else 0.0))
-        levels[t1] = cur
+    base = price_fn(dates[0], "KOSPI")
+    if not base:
+        return lambda d: None
+    levels = {}
+    for d in dates:
+        close = price_fn(d, "KOSPI")
+        levels[d] = (close / base) if close else None
     return lambda d: levels.get(d)

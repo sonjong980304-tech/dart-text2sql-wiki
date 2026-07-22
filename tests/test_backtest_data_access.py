@@ -17,6 +17,8 @@ from src.backtest.data_access import (
     _is_alive,
     _months_before,
     _one_year_before,
+    _price_at,
+    build_benchmark_fn,
     metrics_at,
     mode_financial_quarter_at,
     momentum_12_1,
@@ -437,3 +439,37 @@ def test_mode_financial_quarter_at_counts_per_stock_not_raw_rows(tmp_path):
     # 000001은 원시 행 3개(2026Q1)지만 종목 수로는 1표. 000002/000003은 원시행 1개씩(2025Q4)
     # 이지만 종목 수로는 2표 — 종목당 1표로 세면 2025Q4가 이겨야 한다(원시 행수로 세면 2026Q1이 이김).
     assert mode_financial_quarter_at(conn, "2026-07-18") == "2025Q4"
+
+
+def _price_fn(conn):
+    def fn(asof, code):
+        c, _ = _price_at(conn, code, asof)
+        return c
+    return fn
+
+
+def test_build_benchmark_fn_normalizes_real_kospi_close_to_first_date(tmp_path):
+    """실제 코스피 지수(stock_code='KOSPI') 종가를 첫 시점=1.0 기준으로 정규화해 반환한다.
+
+    예전 동일가중 유니버스 근사 대신 실제 코스피 지수 자체를 벤치마크로 쓰도록 바꿨다."""
+    conn = _conn(tmp_path)
+    _seed_prices(conn, "KOSPI", [
+        ("2024-01-31", 2500.0),
+        ("2024-04-30", 2750.0),
+        ("2024-07-31", 2000.0),
+    ])
+    bench_fn = build_benchmark_fn(
+        ["2024-01-31", "2024-04-30", "2024-07-31"], metrics_fn=None, price_fn=_price_fn(conn),
+    )
+    assert bench_fn("2024-01-31") == 1.0
+    assert bench_fn("2024-04-30") == pytest.approx(1.1)
+    assert bench_fn("2024-07-31") == pytest.approx(0.8)
+
+
+def test_build_benchmark_fn_returns_none_when_kospi_data_missing(tmp_path):
+    """KOSPI 데이터가 아예 없으면(첫 시점부터 조회 불가) 에러로 죽지 않고 전부 None을 반환한다
+    (개별종목 price_fn 결측 처리와 동일한 관례)."""
+    conn = _conn(tmp_path)
+    bench_fn = build_benchmark_fn(["2024-01-31", "2024-04-30"], metrics_fn=None, price_fn=_price_fn(conn))
+    assert bench_fn("2024-01-31") is None
+    assert bench_fn("2024-04-30") is None

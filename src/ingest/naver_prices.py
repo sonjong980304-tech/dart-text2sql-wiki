@@ -26,20 +26,25 @@ def _to_date(raw: str) -> str:
 
 
 def parse_fchart_xml(xml_text: str) -> list[dict]:
-    """fchart 응답 XML을 {date, open, high, low, close, volume} 딕셔너리 리스트로 변환."""
+    """fchart 응답 XML을 {date, open, high, low, close, volume} 딕셔너리 리스트로 변환.
+
+    개별 종목(원화 정수가)뿐 아니라 지수 심볼(예: symbol=KOSPI, "1969.04"처럼 소수점 있는
+    지수 포인트)도 같은 엔드포인트·같은 파이프 형식으로 오므로 int가 아니라 float로 받는다
+    (정수 종목가는 float로 받아도 27520.0 == 27520이라 기존 동작과 동일하다).
+    """
     rows = []
     for raw in _ITEM_RE.findall(xml_text):
         date_raw, open_, high, low, close, volume = raw.split("|")
-        open_i, high_i, low_i, volume_i = int(open_), int(high), int(low), int(volume)
-        halted = open_i == 0 and high_i == 0 and low_i == 0
+        open_f, high_f, low_f, volume_f = float(open_), float(high), float(low), float(volume)
+        halted = open_f == 0 and high_f == 0 and low_f == 0
         rows.append(
             {
                 "date": _to_date(date_raw),
-                "open": None if halted else open_i,
-                "high": None if halted else high_i,
-                "low": None if halted else low_i,
-                "close": int(close),
-                "volume": None if halted else volume_i,
+                "open": None if halted else open_f,
+                "high": None if halted else high_f,
+                "low": None if halted else low_f,
+                "close": float(close),
+                "volume": None if halted else volume_f,
             }
         )
     return rows

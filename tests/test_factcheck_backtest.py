@@ -13,8 +13,12 @@ test_backtest_performance.py 등이 검증한다).
 """
 from __future__ import annotations
 
+import sqlite3
 from types import SimpleNamespace
 
+import pytest
+
+from src.db import init_db
 from src.eval.factcheck import backtest as bt
 
 
@@ -132,3 +136,39 @@ class TestRunBacktestIndexCheck:
         assert "측정불가" in result[0]["note"]
         assert computed == []  # 지수 데이터가 없으면 백테스트 계산 자체를 하지 않는다
         assert cleanup_calls == ["/tmp/copy.db"]
+
+
+class TestFetchKospi1yReturnRealComputation:
+    """_fetch_kospi_1y_return 자체는 (다른 테스트와 달리) 모킹하지 않고 실제로 호출한다.
+
+    가벼운 날짜 조회 2회뿐이라 subprocess/전체 백테스트처럼 느리지 않고, "최근 1년" 계산이
+    실제로 최신일 대비 정확히 12개월 전 시점인지(데이터 전체의 첫 종가가 아닌지)를 직접
+    고정해둘 필요가 있다 — 코스피 데이터가 아직 없어 이 함수가 항상 ValueError로 죽던
+    동안엔 "최신 종가 ÷ 전체 이력 첫 종가"로 계산하는 버그가 가려져 있었다."""
+
+    def _seed(self, tmp_path, rows):
+        db = tmp_path / "kospi.db"
+        init_db(str(db))
+        conn = sqlite3.connect(str(db))
+        for date_str, close in rows:
+            conn.execute(
+                "INSERT INTO prices(stock_code, date, close) VALUES ('KOSPI', ?, ?)",
+                (date_str, close),
+            )
+        conn.commit()
+        conn.close()
+        return str(db)
+
+    def test_compares_latest_to_exactly_12_months_before_not_full_history(self, tmp_path):
+        db = self._seed(tmp_path, [
+            ("2014-04-28", 1000.0),  # 데이터 전체의 첫 값 — 이 값과 비교하면 버그(전체이력 수익률)
+            ("2025-07-22", 2000.0),  # 최신일의 정확히 12개월 전
+            ("2026-07-22", 3000.0),  # 최신일
+        ])
+        result = bt._fetch_kospi_1y_return(db)
+        assert result == pytest.approx(0.5)  # 3000/2000 - 1. 전체이력이면 3000/1000-1=2.0이 나옴
+
+    def test_raises_when_no_data_before_12_months_ago(self, tmp_path):
+        db = self._seed(tmp_path, [("2026-07-22", 3000.0)])  # 최신일 하나뿐, 12개월 전 데이터 없음
+        with pytest.raises(ValueError):
+            bt._fetch_kospi_1y_return(db)
