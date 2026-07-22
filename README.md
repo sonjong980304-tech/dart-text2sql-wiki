@@ -24,7 +24,7 @@
 ```mermaid
 flowchart TB
     Q(["💬 사용자 질문"])
-    SUP{{"🧭 총괄 에이전트<br/>라우팅 · 정합성 검증 · 재시도(최대 3회)"}}
+    SUP{{"🧭 총괄 에이전트<br/>Routing · 정합성 검증 · 재시도(최대 3회)"}}
 
     Q --> SUP
 
@@ -48,9 +48,9 @@ flowchart TB
         BT_PIPE --> BT_HARD --> BT_SOFT
     end
 
-    SUP -->|"라우팅 (복수 도메인 동시 가능)"| KR_BOX
-    SUP -->|라우팅| MACRO_BOX
-    SUP -->|라우팅| BT_BOX
+    SUP -->|Routing| KR_BOX
+    SUP -->|Routing| MACRO_BOX
+    SUP -->|Routing| BT_BOX
 
     KR_BOX --> VERIFY
     MACRO_BOX --> VERIFY
