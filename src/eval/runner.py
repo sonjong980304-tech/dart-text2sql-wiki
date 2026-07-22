@@ -32,15 +32,22 @@ def _isolated_copy(db_path: str | None) -> str:
     src_path = db_path or CONFIG.db_path
     fd, tmp_path = tempfile.mkstemp(suffix=".db", prefix="dart_eval_")
     os.close(fd)
-    src = sqlite3.connect(src_path)
     try:
-        dst = sqlite3.connect(tmp_path)
+        src = sqlite3.connect(src_path)
         try:
-            src.backup(dst)
+            dst = sqlite3.connect(tmp_path)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
         finally:
-            dst.close()
-    finally:
-        src.close()
+            src.close()
+    except Exception:
+        # mkstemp가 만든 파일은 backup() 호출 전부터 이미 디스크에 존재한다 — 백업 도중
+        # 실패(디스크 부족 등)해도 반쯤 만들어진 사본을 지우지 않으면 그대로 누적된다
+        # (실측: disk I/O error로 28.9GB 임시 사본이 안 지워져 디스크가 꽉 찬 사고).
+        _cleanup_copy(tmp_path)
+        raise
     return tmp_path
 
 
