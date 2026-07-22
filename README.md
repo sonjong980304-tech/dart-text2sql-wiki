@@ -7,6 +7,8 @@
 [![LangGraph](https://img.shields.io/badge/LangGraph-multi--agent-1C3C3C)](https://www.langchain.com/langgraph)
 [![SQLite](https://img.shields.io/badge/SQLite-market.db-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 [![OpenAI](https://img.shields.io/badge/OpenAI-LLM-412991?logo=openai&logoColor=white)](https://openai.com/)
+[![EXAONE](https://img.shields.io/badge/EXAONE-Local%20LLM-000000?logo=ollama&logoColor=white)](https://ollama.com/library/exaone3.5)
+[![Qwen2.5-coder](https://img.shields.io/badge/Qwen2.5--coder-Local%20LLM-615CED?logo=ollama&logoColor=white)](https://ollama.com/library/qwen2.5-coder)
 
 한국 상장사 재무/주가/매크로 데이터를 SQLite에 적재하고, 자연어 질문에 Python가 SQL을 활용해 llm이 답하는
 시스템입니다. **두 개의 진입점이 서로 다른 아키텍처로 동작**합니다.
