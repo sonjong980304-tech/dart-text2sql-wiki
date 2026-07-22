@@ -7,8 +7,8 @@
 
 동작:
   - 후보 모델 각각에 대해 LLMClient(model=후보)를 llm_fn 으로 고정해 같은 goldset subset을
-    run_hierarchical 로 재실행한다(scripts/eval_hierarchical_goldset.py의 run_goldset과
-    동일한 판정 로직 재사용 — src/eval/hierarchical_runner.run_hierarchical_eval).
+    run_hierarchical 로 재실행한다(src/eval/hierarchical_runner.run_hierarchical_eval의
+    판정 로직을 그대로 재사용).
     model override가 있으면 LLMClient.model_for()가 role(sql/judge/...)과 무관하게 그
     모델을 그대로 쓰므로(src/llm.py), 라우팅·SQL생성·검증·종합결론 전 단계가 후보 모델
     하나로 일관되게 실행된다.

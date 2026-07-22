@@ -789,7 +789,6 @@ uvicorn web.app:app --reload      # http://127.0.0.1:8000
 | GET | `/api/models` | 선택 가능한 LLM 목록 + 가용성 |
 | GET/PUT/DELETE | `/api/wiki`, `/api/wiki/{id}` | 질의 기록 로그(하위호환 유지, 신규 질의는 자동 저장 안 함) |
 | GET | `/api/stats` | 기록 통계 |
-| GET | `/api/eval` | 정답셋 평가(legacy 파이프라인 기준) |
 | GET | `/api/macro`, `/api/macro/signal`, `/api/macro/history` | 거시지표(환율/지수/파마프렌치) + 파생 신호 |
 | GET | `/api/metric-defs`, `/api/sectors` | 백테스트 UI용 지표 정의 / 업종 목록 |
 | POST | `/api/backtest` | 백테스트 실행 |
@@ -841,18 +840,17 @@ OLLAMA_MODEL=qwen2.5-coder:7b-instruct-q4_K_M
 
 ### 평가 (`src/eval/`)
 
-- **legacy 3층 평가**(`evaluator.py`/`goldset.py`/`runner.py`): `cli.py eval`/`GET /api/eval`이
-  사용. Layer1 Execution Accuracy(결과셋 denotation 비교) / Layer2 LLM-as-Judge(1~5점) /
+- **legacy 3층 평가**(`evaluator.py`/`goldset.py`/`runner.py`): `cli.py eval`이 사용.
+  Layer1 Execution Accuracy(결과셋 denotation 비교) / Layer2 LLM-as-Judge(1~5점) /
   Layer3 실행 가능성. `src/eval/goldset.py`의 50문항 기준.
-- **신규 계층형 평가**(`hierarchical_runner.py`, `scripts/eval_hierarchical_goldset.py`):
-  같은 goldset을 `run_hierarchical`로 재실행합니다. 신규 구조의 산출물은 결과셋이 아니라
-  종합결론+도메인별 원본결과라 직접 행 비교가 불가능해서, LLM judge 방식으로 "정답 SQL
-  실행 결과"와 "신규 구조 답변"의 일치 여부를 판정합니다. 평가는 항상 원본 DB의 격리
-  사본에서 실행됩니다(원본 보호).
+- **신규 계층형 평가**(`hierarchical_runner.py`): 같은 goldset을 `run_hierarchical`로
+  재실행합니다. 신규 구조의 산출물은 결과셋이 아니라 종합결론+도메인별 원본결과라 직접
+  행 비교가 불가능해서, LLM judge 방식으로 "정답 SQL 실행 결과"와 "신규 구조 답변"의
+  일치 여부를 판정합니다. 평가는 항상 원본 DB의 격리 사본에서 실행됩니다(원본 보호).
+  `scripts/eval_model_comparison.py`가 이 판정 로직을 재사용해 후보 LLM 모델들을 비교합니다.
 
 ```bash
 python cli.py eval                              # legacy 평가
-python scripts/eval_hierarchical_goldset.py      # 신규 계층형 평가
 ```
 
 </details>

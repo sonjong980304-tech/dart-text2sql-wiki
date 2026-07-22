@@ -1,8 +1,7 @@
 """신규 goldset 러너(src/eval/hierarchical_runner.py) 단위테스트 (HA-14, AC18/AC20).
 
 판정 로직(judge)·호출 카운터·오케스트레이션을 mock LLM/주입 fixture 로 결정론적으로 검증한다
-(실제 OpenAI API·실제 그래프 없이). 실제 goldset 대량 재실행은 scripts/eval_hierarchical_goldset.py
-가 담당하고, 그 정확도/성능 수치는 .omc/research/ 에 문서화한다.
+(실제 OpenAI API·실제 그래프 없이).
 """
 from __future__ import annotations
 

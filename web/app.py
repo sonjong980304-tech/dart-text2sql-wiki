@@ -11,7 +11,6 @@
   PUT    /api/wiki/{id}   : SQL 수정 + 검증/평가 표시 (+태그)
   DELETE /api/wiki/{id}   : 삭제
   GET    /api/stats       : 기록 통계
-  GET    /api/eval        : 정답셋 평가 (?limit=, legacy 파이프라인 기준)
   GET    /api/macro        : 거시지표(환율/해외·국내 지수/파마프렌치 5팩터)
   GET    /api/macro/signal : 거시지표 파생 신호
   GET    /api/macro/history: 거시지표 히스토리
@@ -495,15 +494,6 @@ def api_stats():
         return WikiStore(conn).stats()
     finally:
         conn.close()
-
-
-@app.get("/api/eval")
-def api_eval(limit: Optional[int] = 10):
-    from src.eval.runner import run_evaluation
-
-    rep = run_evaluation(limit=limit)
-    rep.pop("rows", None)  # 요약만
-    return rep
 
 
 # ---------------------------------------------------------------------------
