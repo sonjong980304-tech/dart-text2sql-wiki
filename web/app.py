@@ -87,7 +87,7 @@ class RerunReq(BaseModel):
 LLM_MODELS = [
     {"id": "gpt-5.4-mini", "label": "GPT-5.4-mini (OpenAI)", "provider": "openai"},
     {"id": "gpt-5.5", "label": "GPT-5.5 (OpenAI)", "provider": "openai"},
-    {"id": "exaone:latest", "label": "EXAONE (로컬)", "provider": "ollama"},
+    {"id": "exaone3.5:7.8b", "label": "EXAONE (로컬)", "provider": "ollama"},
     {"id": "qwen2.5-coder:7b-instruct-q4_K_M", "label": "Qwen2.5-coder (로컬)", "provider": "ollama"},
 ]
 
@@ -698,7 +698,8 @@ def api_allweather():
     if snap is None:
         return {
             "available": False, "computed_at": None, "weights": {},
-            "cagr": None, "mdd": None, "sharpe": None, "cumulative_return": None,
+            "cagr": None, "mdd": None, "sharpe": None, "sortino": None,
+            "cumulative_return": None,
             "backtest_curve": [],
         }
     return {
@@ -708,6 +709,7 @@ def api_allweather():
         "cagr": snap["cagr"],
         "mdd": snap["mdd"],
         "sharpe": snap["sharpe"],
+        "sortino": snap["sortino"],
         "cumulative_return": snap["cumulative_return"],
         "backtest_curve": snap["backtest_curve"],
         "created_at": snap["created_at"],

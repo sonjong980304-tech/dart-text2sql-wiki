@@ -98,6 +98,11 @@
         <div class="note-ref">무위험이자율: 미국 3개월 국채(^IRX) 시점별 값</div>
       </div>
       <div class="metric">
+        <div class="l">소르티노비율</div>
+        <div class="v" id="sortinoV">–</div>
+        <div class="note-ref">하방편차 기준 (손실 구간만 반영)</div>
+      </div>
+      <div class="metric">
         <div class="l">누적수익률</div>
         <div class="v" id="cumV">–</div>
       </div>
@@ -169,6 +174,7 @@ async function load(){
     const cagrEl=document.getElementById('cagrV'); cagrEl.textContent=pct(d.cagr,1); cagrEl.className='v '+((d.cagr||0)>=0?'good':'bad');
     const mddEl=document.getElementById('mddV'); mddEl.textContent=pct(d.mdd,1); mddEl.className='v bad';
     document.getElementById('sharpeV').textContent = (d.sharpe==null)?'–':Number(d.sharpe).toLocaleString(undefined,{maximumFractionDigits:2});
+    document.getElementById('sortinoV').textContent = (d.sortino==null)?'–':Number(d.sortino).toLocaleString(undefined,{maximumFractionDigits:2});
     const cumEl=document.getElementById('cumV'); cumEl.textContent=pct(d.cumulative_return,1); cumEl.className='v '+((d.cumulative_return||0)>=0?'good':'bad');
 
     const curve = d.backtest_curve||[];

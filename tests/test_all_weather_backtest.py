@@ -11,7 +11,12 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
-from src.allweather.backtest import rebalance_points, run_walk_forward
+from src.allweather.backtest import (
+    rebalance_points,
+    run_walk_forward,
+    sharpe_ratio,
+    sortino_ratio,
+)
 
 
 def _panel(years: int = 10) -> pd.DataFrame:
@@ -97,9 +102,42 @@ def test_snapshot_has_all_metrics():
         panel, irx, monte_carlo_fn=lambda p, **k: _fake_mc(p, **k), n_simulations=10,
         today=date(2024, 1, 1),
     )
-    for key in ("computed_at", "weights", "cagr", "mdd", "sharpe", "cumulative_return", "backtest_curve"):
+    for key in (
+        "computed_at", "weights", "cagr", "mdd", "sharpe", "sortino",
+        "cumulative_return", "backtest_curve",
+    ):
         assert key in snap
     assert set(snap["weights"].keys()) == set(panel.columns)
     assert isinstance(snap["backtest_curve"], list) and len(snap["backtest_curve"]) >= 2
     assert snap["mdd"] <= 0  # 최대낙폭은 0 이하
     assert snap["computed_at"] == "2024-01-01"
+
+
+def test_sortino_ratio_matches_manual_downside_deviation():
+    # 손실 구간이 섞인 정상 케이스 — 수기 계산값과 일치해야 한다.
+    returns = [0.02, -0.01, 0.03, -0.02, 0.01]
+    avg_rf = 0.03
+    result = sortino_ratio(returns, avg_rf, periods_per_year=12)
+    s = pd.Series(returns)
+    downside = s.clip(upper=0.0)
+    downside_dev = float((downside ** 2).mean()) ** 0.5
+    expected = (float(s.mean()) * 12 - avg_rf) / (downside_dev * (12 ** 0.5))
+    assert abs(result - expected) < 1e-9
+
+
+def test_sortino_ratio_no_losses_returns_zero():
+    # 손실이 전혀 없으면(전부 양수) 하방편차가 0이라 무한대가 되므로 0을 반환한다.
+    returns = [0.01, 0.02, 0.015, 0.03]
+    assert sortino_ratio(returns, 0.03) == 0.0
+
+
+def test_sortino_ratio_insufficient_data_returns_zero():
+    assert sortino_ratio([0.01], 0.03) == 0.0
+    assert sortino_ratio([], 0.03) == 0.0
+
+
+def test_sortino_ratio_differs_from_sharpe_ratio():
+    # 두 함수가 실수로 동일 로직 복붙이 아님을 증명 — 하방편차만 반영하므로 값이 달라야 한다.
+    returns = [0.02, -0.01, 0.03, -0.02, 0.01]
+    avg_rf = 0.03
+    assert sharpe_ratio(returns, avg_rf) != sortino_ratio(returns, avg_rf)

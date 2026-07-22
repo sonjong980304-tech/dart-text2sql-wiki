@@ -27,7 +27,7 @@ def _seed(db: str) -> None:
         persist_snapshot(conn, {
             "computed_at": "2026-07-01",
             "weights": {"005930.KS": 0.3, "QQQ": 0.4, "TLT": 0.2, "411060.KS": 0.1},
-            "cagr": 0.12, "mdd": -0.2, "sharpe": 1.1, "cumulative_return": 0.9,
+            "cagr": 0.12, "mdd": -0.2, "sharpe": 1.1, "sortino": 1.4, "cumulative_return": 0.9,
             "backtest_curve": [{"date": "2016-01-31", "nav": 1.0}, {"date": "2026-07-01", "nav": 1.9}],
         })
     finally:
@@ -44,6 +44,7 @@ def test_api_allweather_returns_stored_snapshot(tmp_path, monkeypatch):
     assert d["available"] is True
     assert d["cagr"] == 0.12 and d["mdd"] == -0.2
     assert d["sharpe"] == 1.1 and d["cumulative_return"] == 0.9
+    assert d["sortino"] == 1.4
     assert d["weights"]["005930.KS"] == 0.3
     assert len(d["backtest_curve"]) == 2
 

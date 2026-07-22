@@ -17,14 +17,15 @@ def persist_snapshot(conn, snapshot: dict) -> None:
     """스냅샷 dict를 all_weather_snapshot에 append(INSERT, UPDATE 아님 — 이력 추적)."""
     conn.execute(
         "INSERT INTO all_weather_snapshot("
-        "computed_at, weights, cagr, mdd, sharpe, cumulative_return, backtest_curve, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
+        "computed_at, weights, cagr, mdd, sharpe, sortino, cumulative_return, backtest_curve, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
         (
             snapshot["computed_at"],
             json.dumps(snapshot["weights"], ensure_ascii=False),
             snapshot["cagr"],
             snapshot["mdd"],
             snapshot["sharpe"],
+            snapshot["sortino"],
             snapshot["cumulative_return"],
             json.dumps(snapshot["backtest_curve"], ensure_ascii=False),
             now_iso(),
@@ -42,6 +43,7 @@ def _row_to_snapshot(row) -> dict:
         "cagr": row["cagr"],
         "mdd": row["mdd"],
         "sharpe": row["sharpe"],
+        "sortino": row["sortino"],
         "cumulative_return": row["cumulative_return"],
         "backtest_curve": json.loads(row["backtest_curve"]) if row["backtest_curve"] else [],
         "created_at": row["created_at"],
@@ -51,7 +53,7 @@ def _row_to_snapshot(row) -> dict:
 def get_latest_snapshots(conn, n: int = 2) -> list[dict]:
     """최근 n개 스냅샷을 최신순(id DESC)으로 반환한다(AC13 델타에 직전 2행 사용)."""
     rows = conn.execute(
-        "SELECT id, computed_at, weights, cagr, mdd, sharpe, cumulative_return, "
+        "SELECT id, computed_at, weights, cagr, mdd, sharpe, sortino, cumulative_return, "
         "backtest_curve, created_at FROM all_weather_snapshot ORDER BY id DESC LIMIT ?",
         (n,),
     ).fetchall()

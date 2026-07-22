@@ -19,6 +19,7 @@ def _snap(computed_at: str, sam_w: float):
         "cagr": 0.11,
         "mdd": -0.25,
         "sharpe": 1.05,
+        "sortino": 1.35,
         "cumulative_return": 0.8,
         "backtest_curve": [{"date": "2016-01-31", "nav": 1.0}, {"date": computed_at, "nav": 1.8}],
     }
@@ -33,7 +34,7 @@ def test_table_created_by_init_db(tmp_path):
         assert "all_weather_snapshot" in tables
         cols = {r[1] for r in conn.execute("PRAGMA table_info(all_weather_snapshot)")}
         assert {
-            "computed_at", "weights", "cagr", "mdd", "sharpe",
+            "computed_at", "weights", "cagr", "mdd", "sharpe", "sortino",
             "cumulative_return", "backtest_curve", "created_at",
         } <= cols
     finally:
@@ -64,6 +65,7 @@ def test_get_latest_snapshot_parses_json(tmp_path):
         latest = get_latest_snapshot(conn)
         assert latest["computed_at"] == "2026-07-01"
         assert latest["weights"]["005930.KS"] == 0.30  # JSON 파싱됨
+        assert latest["sortino"] == 1.35
         assert isinstance(latest["backtest_curve"], list)
         two = get_latest_snapshots(conn, 2)
         assert [s["computed_at"] for s in two] == ["2026-07-01", "2026-06-01"]  # 최신순

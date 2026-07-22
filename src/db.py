@@ -398,6 +398,7 @@ CREATE TABLE IF NOT EXISTS all_weather_snapshot (
     cagr              REAL,            -- 연평균 복리 수익률 (소수, walk-forward 곡선 기준)
     mdd               REAL,            -- 최대낙폭 (소수, 0 이하)
     sharpe            REAL,            -- 샤프비율 (실현 곡선 기준, 시점별 ^IRX 무위험이자율 반영)
+    sortino           REAL,            -- 소르티노비율 (하방편차 기준, sharpe와 동일 관례)
     cumulative_return REAL,            -- 누적수익률 (소수)
     backtest_curve    TEXT,            -- 자산곡선 (JSON 배열, 각 원소 date/nav)
     created_at        TEXT             -- 생성 시각 (ISO)
@@ -454,6 +455,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for col in ("open", "high", "low", "volume"):
         if col not in pcols:
             conn.execute(f"ALTER TABLE prices ADD COLUMN {col} REAL")
+    awcols = {r["name"] for r in conn.execute("PRAGMA table_info(all_weather_snapshot)")}
+    if "sortino" not in awcols:
+        conn.execute("ALTER TABLE all_weather_snapshot ADD COLUMN sortino REAL")
     conn.commit()
 
 

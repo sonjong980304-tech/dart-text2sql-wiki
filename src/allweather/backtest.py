@@ -67,6 +67,25 @@ def sharpe_ratio(period_returns: list[float], avg_risk_free: float, periods_per_
     return (ann_ret - avg_risk_free) / ann_vol
 
 
+def sortino_ratio(period_returns: list[float], avg_risk_free: float, periods_per_year: int = 12) -> float:
+    """실현 구간수익률에서 연율화 소르티노비율. 손실(음수) 구간만으로 하방편차를 계산한다.
+
+    분자는 샤프비율과 동일(연율화 초과수익), 분모만 전체 표준편차 대신 하방편차를 쓴다(상방
+    변동성은 리스크로 안 침). 손실 구간이 아예 없으면 하방편차가 0이 되어 정의상 무한대이므로
+    0을 반환한다(sharpe_ratio의 std<=0 관례와 동일 정신).
+    """
+    if len(period_returns) < 2:
+        return 0.0
+    s = pd.Series(period_returns)
+    downside = s.clip(upper=0.0)
+    downside_dev = float((downside ** 2).mean()) ** 0.5
+    if downside_dev <= 0:
+        return 0.0
+    ann_ret = float(s.mean()) * periods_per_year
+    ann_downside_dev = downside_dev * (periods_per_year ** 0.5)
+    return (ann_ret - avg_risk_free) / ann_downside_dev
+
+
 # ---------------------------------------------------------------------------
 # walk-forward 백테스트
 # ---------------------------------------------------------------------------
@@ -85,7 +104,7 @@ def run_walk_forward(
     돌려 최적 비중을 구하고, t→다음 시점 구간의 실현 수익률을 누적한다. 마지막 시점의 비중이
     '현재 추천 비중'(화면·알림에 노출).
 
-    반환: computed_at / weights / cagr / mdd / sharpe / cumulative_return / backtest_curve.
+    반환: computed_at / weights / cagr / mdd / sharpe / sortino / cumulative_return / backtest_curve.
     """
     today = today or date.today()
     cols = list(panel.columns)
@@ -144,6 +163,7 @@ def run_walk_forward(
         "cagr": round(cagr(navs, years), 6),
         "mdd": round(max_drawdown(navs), 6),
         "sharpe": round(sharpe_ratio(period_returns, avg_rf), 6),
+        "sortino": round(sortino_ratio(period_returns, avg_rf), 6),
         "cumulative_return": round(navs[-1] / navs[0] - 1.0, 6),
         "backtest_curve": curve,
     }
