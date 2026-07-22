@@ -9,8 +9,6 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from src.config import CONFIG
-from src.eval.goldset import GOLDSET
 from src.factors.fama_french import (
     classify_factor_intent,
     fetch_factor_data,
@@ -197,15 +195,6 @@ def test_handle_query_returns_error_message_on_fetch_failure_without_raising():
 # --------------------------------------------------------------------------
 # format_factor_result
 # --------------------------------------------------------------------------
-@pytest.mark.skipif(not CONFIG.has_openai_key, reason="OpenAI 키 필요(README 관례: 키 없으면 스킵)")
-def test_classify_factor_intent_no_false_positive_on_goldset_questions():
-    """기존 goldset 50문항이 파마프렌치 경로로 오분류되지 않는지 실제 LLM으로 확인."""
-    false_positives = [
-        item["question"] for item in GOLDSET if classify_factor_intent(item["question"])
-    ]
-    assert false_positives == []
-
-
 def test_format_factor_result_includes_dataset_and_all_rows():
     intent = {"dataset": "5factor", "frequency": "monthly"}
     rows = [

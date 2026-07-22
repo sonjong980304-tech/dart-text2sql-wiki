@@ -5,7 +5,6 @@
 3. sql_gen_node   : 정제 질문 → SQL 생성 (LLM, 폴백=휴리스틱)
 4. execute_node   : SQLite 실행 (캐시 도출 없음, 항상 새로 실행)
 5. record_node    : 성공한 질의를 기록 로그(wiki 테이블)에 항상 저장
-6. eval_node      : 3층 평가
 
 설계 변경(기록 전용 전환)
 ------------------------
@@ -405,13 +404,6 @@ def make_nodes(deps: Deps) -> dict:
             ),
         }
 
-    # ---- 6. eval ----
-    def eval_node(state: GraphState) -> dict:
-        from src.eval.evaluator import evaluate_state
-
-        ev = evaluate_state(state, deps)
-        return {"evaluation": ev, "notes": _note(state, f"eval: {ev.get('summary','')}")}
-
     return {
         "refine_node": refine_node,
         "router_node": router_node,
@@ -420,5 +412,4 @@ def make_nodes(deps: Deps) -> dict:
         "diagnose_node": diagnose_node,
         "record_node": record_node,
         "human_review_node": human_review_node,
-        "eval_node": eval_node,
     }

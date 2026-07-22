@@ -4,7 +4,6 @@
 사용 예:
   python cli.py setup-dummy                 # 더미 데이터 생성
   python cli.py query "PER이 낮은 5개 회사"   # 질의
-  python cli.py eval --limit 10              # 3층 평가
   python cli.py wiki-eff                     # 위키 효율 리포트
   python cli.py wiki list                    # 위키 목록
   python cli.py wiki verify 3                # 위키 항목 검증
@@ -158,7 +157,7 @@ def cmd_query(args):
 
     p = Pipeline()
     try:
-        s = p.run(args.question, do_eval=args.eval)
+        s = p.run(args.question)
     finally:
         pass
     print(f"질문(원본) : {s.get('raw_question')}")
@@ -183,33 +182,7 @@ def cmd_query(args):
             print(format_audit_warnings(warnings))
         if s.get("chart_path"):
             print(f"\n차트: {s.get('chart_path')}")
-    if args.eval and s.get("evaluation"):
-        ev = s["evaluation"]
-        print(f"\n평가: {ev.get('summary')}")
-        if ev["layer2"].get("applicable"):
-            print(f"  Judge 사유: {ev['layer2'].get('reason')}")
     p.close()
-
-
-def cmd_eval(args):
-    import json
-
-    from src.eval.runner import format_eval_report, run_evaluation
-
-    rep = run_evaluation(limit=args.limit, offline=args.offline)
-    if args.json:
-        # 외부 스크립트/도구가 execution_accuracy.ex_pct 등을 파싱할 수 있도록,
-        # stdout에는 리포트 dict의 JSON만 출력한다(부가 텍스트 없이).
-        print(json.dumps(rep, ensure_ascii=False))
-        return
-    off = " [offline 강제]" if args.offline else ""
-    print(f"[설정] {CONFIG.summary()}{off}")
-    print(f"정답셋 평가 실행 중 (limit={args.limit or '전체'})...\n")
-    print(format_eval_report(rep))
-    if args.verbose:
-        print("\n[문항별]")
-        for r in rep["rows"]:
-            print(f"  #{r['id']:2d} EX={r['ex']} L3={r['l3']} src={r['sql_source']} | {r['question']}")
 
 
 def cmd_wiki(args):
@@ -263,15 +236,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_q = sub.add_parser("query", help="자연어 질의")
     p_q.add_argument("question")
-    p_q.add_argument("--eval", action="store_true", help="3층 평가도 수행")
-
-    p_e = sub.add_parser("eval", help="정답셋 3층 평가")
-    p_e.add_argument("--limit", type=int, default=None)
-    p_e.add_argument("--verbose", "-v", action="store_true")
-    p_e.add_argument("--offline", action="store_true",
-                     help="LLM 강제 비활성화(휴리스틱 폴백만 사용, 결정론 보장)")
-    p_e.add_argument("--json", action="store_true",
-                     help="평가 리포트(dict)를 JSON으로 stdout 출력")
 
     p_w = sub.add_parser("wiki", help="기록 관리")
     wsub = p_w.add_subparsers(dest="wiki_cmd", required=True)
@@ -291,7 +255,6 @@ def main():
     dispatch = {
         "setup-dummy": cmd_setup_dummy,
         "query": cmd_query,
-        "eval": cmd_eval,
         "wiki": cmd_wiki,
     }
     dispatch[args.cmd](args)

@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""US-8: factcheck 5개 도메인 통합 실행 + 리포트 생성 (1회성 실측 스크립트)."""
+"""US-8: factcheck 5개 도메인 통합 실행 + 리포트 생성 (1회성 실측 스크립트).
+
+--model로 시스템 LLM(SQL 생성 등)을 로컬 모델(예: exaone3.5:7.8b, qwen2.5-coder:7b-
+instruct-q4_K_M)로 바꿔 재실행할 수 있다(scripts/eval_model_comparison.py와 동일한
+로컬 LLM 비교 취지). 차트 판정(vision)은 로컬 모델이 이미지를 못 보므로 --model과
+무관하게 항상 시스템 기본(gpt-5.4-mini)을 그대로 쓴다(build_vision_client 불변).
+"""
 from __future__ import annotations
 
+import argparse
 import sys
+import time
 import traceback
 from datetime import date, datetime
 from pathlib import Path
@@ -24,7 +32,6 @@ from src.eval.factcheck.screening import _recompute_top_n, run_screening_check
 from src.eval.factcheck.tolerance import within_pct_tolerance
 
 RESEARCH_DIR = Path(__file__).resolve().parent.parent / ".omc" / "research"
-REPORT_PATH = RESEARCH_DIR / "factcheck-report.md"
 _FIN_METRIC = "operating_profit"
 _INDEX_TOL = 0.025
 
@@ -126,12 +133,38 @@ def _verdict(p):
     return {True: "pass", False: "fail", None: "측정불가"}[p]
 
 
+def _db_size_gb() -> float:
+    try:
+        return Path(CONFIG.db_path).stat().st_size / (1024**3)
+    except OSError:
+        return 0.0
+
+
+def _timed(fn):
+    """fn(item)->결과 호출마다 걸린 시간을 fn.times에 누적하는 래퍼(항목별 평균응답시간 측정용)."""
+    times: list[float] = []
+
+    def _inner(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            times.append(time.perf_counter() - t0)
+
+    _inner.times = times
+    return _inner
+
+
+def _avg_time(times) -> str:
+    return f"{sum(times) / len(times):.2f}s" if times else "N/A"
+
+
 def build_report(sections, kospi_note, kospi_meta, model_summary, errors):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
         "# 퀀트 어시스턴트 factcheck 실측 리포트 (US-8 / AC6)", "",
         f"- 실측 일시: {ts}", f"- 모델/설정: {model_summary}",
-        f"- DB: 원본({CONFIG.db_path}, 약 38.67GB)을 **엔진 레벨 읽기전용(mode=ro)** 으로 조회 "
+        f"- DB: 원본({CONFIG.db_path}, 약 {_db_size_gb():.2f}GB)을 **엔진 레벨 읽기전용(mode=ro)** 으로 조회 "
         "(디스크 용량 절약을 위해 격리 사본을 만들지 않음 — read-only 연결이 원본 write를 물리적으로 차단).",
         "- 판정: pass=허용오차 내 · fail=허용오차 밖 · 측정불가=외부 재조회/시스템 응답 확보 실패.", "",
     ]
@@ -144,26 +177,39 @@ def build_report(sections, kospi_note, kospi_meta, model_summary, errors):
         lines.append(f"- **실패/측정불가**: {kospi_note}")
     lines.append("")
     total_pass = total_fail = total_unmeasurable = 0
+    excluded_pass = excluded_fail = excluded_unmeasurable = 0
     for sec in sections:
         items = sec["items"]
         p, f, u = _counts(items)
-        total_pass += p; total_fail += f; total_unmeasurable += u
+        scored = sec.get("score", True)
+        if scored:
+            total_pass += p; total_fail += f; total_unmeasurable += u
+        else:
+            excluded_pass += p; excluded_fail += f; excluded_unmeasurable += u
         measurable = p + f
         lines += [f"## {sec['title']}", ""]
         if sec.get("note"):
             lines += [f"> {sec['note']}", ""]
+        if not scored:
+            lines += ["> **종합 통과율 집계에서 제외** — 시가총액가중 지수(코스피) vs 동일가중 백테스트는 "
+                      "구성 방식 자체가 달라 비교 방법론이 구조적으로 성립하지 않는다(시스템/모델 정확도 지표가 아님).", ""]
         lines.append("| " + " | ".join(sec["headers"]) + " |")
         lines.append("|" + "|".join(["---"] * len(sec["headers"])) + "|")
         for row in sec["rows"]:
             lines.append("| " + " | ".join(str(c) for c in row) + " |")
+        avg_line = f" · 평균응답시간 {_avg_time(sec['avg_times'])}({len(sec['avg_times'])}건)" if sec.get("avg_times") is not None else ""
         lines += ["", f"- 통과율(측정가능 기준): {_rate(p, measurable)} ({p}/{measurable}) · "
-                  f"측정불가 {u}건 · 전체 {len(items)}건", ""]
+                  f"측정불가 {u}건 · 전체 {len(items)}건" + ("" if scored else " · **[집계 제외]**") + avg_line, ""]
     total_items = total_pass + total_fail + total_unmeasurable
     total_measurable = total_pass + total_fail
+    all_llm_times = [t for sec in sections for t in sec.get("avg_times") or []]
     lines += ["## 종합 통과율", "",
-        f"- 전체 항목: {total_items}건 (pass {total_pass} · fail {total_fail} · 측정불가 {total_unmeasurable})",
+        f"- 전체 항목(채점 대상): {total_items}건 (pass {total_pass} · fail {total_fail} · 측정불가 {total_unmeasurable})",
         f"- **측정가능 기준 통과율: {_rate(total_pass, total_measurable)} ({total_pass}/{total_measurable})**",
-        f"- **전체 항목 기준 통과율: {_rate(total_pass, total_items)} ({total_pass}/{total_items})**", ""]
+        f"- **전체 항목 기준 통과율: {_rate(total_pass, total_items)} ({total_pass}/{total_items})**",
+        f"- (참고, 채점 제외) 5b 코스피 비교: pass {excluded_pass} · fail {excluded_fail} · 측정불가 {excluded_unmeasurable} "
+        "— 비교 방법론 불일치로 종합 통과율에는 반영하지 않음",
+        f"- **LLM 항목(1~4번, {len(all_llm_times)}건) 평균응답시간: {_avg_time(all_llm_times)}**", ""]
     if errors:
         lines += ["## 도메인 실행 오류(격리됨)", ""]
         for dom, err in errors.items():
@@ -173,11 +219,19 @@ def build_report(sections, kospi_note, kospi_meta, model_summary, errors):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", type=str, default=None,
+                     help="시스템 LLM(SQL 생성 등)을 이 모델로 강제(예: exaone3.5:7.8b). "
+                          "생략 시 .env 기본 설정(gpt-5.4-mini) 그대로. 차트 vision 판정은 영향 없음.")
+    args = ap.parse_args()
+
     RESEARCH_DIR.mkdir(parents=True, exist_ok=True)
-    model_summary = CONFIG.summary()
-    llm_fn = build_system_llm_fn("sql")
+    report_suffix = f"-{args.model}".replace(":", "_").replace(".", "_") if args.model else ""
+    report_path = RESEARCH_DIR / f"factcheck-report{report_suffix}.md"
+    model_summary = f"{CONFIG.summary()} (--model override: {args.model})" if args.model else CONFIG.summary()
+    llm_fn = build_system_llm_fn("sql", model=args.model)
     if llm_fn is None:
-        print("[경고] 시스템 LLM 미가용 — 휴리스틱 폴백")
+        print(f"[경고] 시스템 LLM 미가용({args.model or '기본설정'}) — 휴리스틱 폴백")
     vision_client = build_vision_client()
     conn = connect_readonly(CONFIG.db_path)
     sections = []; errors = {}
@@ -189,51 +243,55 @@ def main():
     name_of = {s["stock_code"]: s["name"] for s in top10}
 
     print("[1/5] 재무제표(DART ±1%) …")
+    fin_llm_fn = _timed(make_financial_llm_fn(conn, llm_fn))
     try:
         fin_items = [{"stock_code": s["stock_code"], "name": s["name"], "metric": _FIN_METRIC} for s in top10]
-        fin_res = run_financials_check(fin_items, make_financial_llm_fn(conn, llm_fn), CONFIG.dart_api_key or None)
+        fin_res = run_financials_check(fin_items, fin_llm_fn, CONFIG.dart_api_key or None)
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc(); errors["financials"] = f"{type(exc).__name__}: {exc}"
         fin_res = [{"stock_code": s["stock_code"], "expected": None, "actual": None, "pass": None, "note": "측정불가(도메인 예외)"} for s in top10]
-    sections.append({"title": "1. 재무제표 사실확인 (AC1 · 영업이익 vs OpenDART, ±1%)",
+    sections.append({"title": "1. 재무제표 사실확인 (AC1 · 영업이익 vs OpenDART, ±1%)", "avg_times": fin_llm_fn.times,
         "headers": ["종목", "DART원문(기대)", "시스템응답(실제)", "판정/비고"], "items": fin_res,
         "rows": [(f"{name_of.get(r['stock_code'], r['stock_code'])}({r['stock_code']})", _fmt_num(r["expected"]),
                   _fmt_num(r["actual"]), _verdict(r["pass"]) + (f" · {r['note']}" if r.get("note") else "")) for r in fin_res]})
 
     print("[2/5] 주가(네이버 완전일치) …")
+    price_llm_fn = _timed(make_price_llm_fn(conn, llm_fn))
     try:
         price_items = [{"stock_code": s["stock_code"], "name": s["name"]} for s in top10]
-        price_res = run_price_check(price_items, make_price_llm_fn(conn, llm_fn))
+        price_res = run_price_check(price_items, price_llm_fn)
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc(); errors["price"] = f"{type(exc).__name__}: {exc}"
         price_res = [{"stock_code": s["stock_code"], "expected": None, "actual": None, "pass": None, "note": "측정불가(도메인 예외)"} for s in top10]
-    sections.append({"title": "2. 실시간 주가 (AC2 · 오늘 종가 vs 네이버 fchart, 완전일치)",
+    sections.append({"title": "2. 실시간 주가 (AC2 · 오늘 종가 vs 네이버 fchart, 완전일치)", "avg_times": price_llm_fn.times,
         "headers": ["종목", "네이버(기대)", "시스템응답(실제)", "판정/비고"], "items": price_res,
         "rows": [(f"{name_of.get(r['stock_code'], r['stock_code'])}({r['stock_code']})", _fmt_num(r["expected"]),
                   _fmt_num(r["actual"]), _verdict(r["pass"]) + (f" · {r['note']}" if r.get("note") else "")) for r in price_res]})
 
     print("[3/5] 차트(데이터일치 + vision) …")
+    chart_llm_fn = _timed(make_chart_llm_fn(conn, llm_fn))
     try:
         chart_items = []
         for c in _CHART_CASES:
             expected = _recompute_top_n(conn, {"metric": c["metric"], "top_n": c["top_n"], "ascending": c["ascending"]})
             chart_items.append({"question": c["question"], "expected_data": expected})
-        chart_res = run_chart_check(chart_items, make_chart_llm_fn(conn, llm_fn), make_vision_fn(vision_client=vision_client))
+        chart_res = run_chart_check(chart_items, chart_llm_fn, make_vision_fn(vision_client=vision_client))
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc(); errors["chart"] = f"{type(exc).__name__}: {exc}"
         chart_res = [{"question": c["question"], "data_match": None, "vision_verdict": None, "pass": None, "note": "측정불가(도메인 예외)"} for c in _CHART_CASES]
-    sections.append({"title": "3. 차트 (AC3 · 근거데이터 일치 + gpt-5.4-mini vision)",
+    sections.append({"title": "3. 차트 (AC3 · 근거데이터 일치 + gpt-5.4-mini vision)", "avg_times": chart_llm_fn.times,
         "headers": ["질문", "데이터일치", "vision판정", "판정/비고"], "items": chart_res,
         "rows": [((r["question"] or "")[:40].replace("|", "/"), str(r.get("data_match")), str(r.get("vision_verdict")),
                   _verdict(r["pass"]) + (f" · {r['note']}" if r.get("note") else "")) for r in chart_res]})
 
     print("[4/5] 스크리닝(top-N 재계산 완전일치) …")
+    screen_llm_fn = _timed(make_screening_llm_fn(conn, llm_fn))
     try:
-        screen_res = run_screening_check(_SCREENING_CASES, make_screening_llm_fn(conn, llm_fn), conn)
+        screen_res = run_screening_check(_SCREENING_CASES, screen_llm_fn, conn)
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc(); errors["screening"] = f"{type(exc).__name__}: {exc}"
         screen_res = [{"question": c["question"], "pass": None, "note": "측정불가(도메인 예외)"} for c in _SCREENING_CASES]
-    sections.append({"title": "4. 스크리닝 (AC4 · top-N vs DB 재계산, 완전일치)",
+    sections.append({"title": "4. 스크리닝 (AC4 · top-N vs DB 재계산, 완전일치)", "avg_times": screen_llm_fn.times,
         "headers": ["질문", "판정", "비고"], "items": screen_res,
         "rows": [((r["question"] or "")[:40].replace("|", "/"), _verdict(r["pass"]), (r.get("note") or "")[:80].replace("|", "/")) for r in screen_res]})
 
@@ -257,21 +315,27 @@ def main():
         index_res = [{"scenario": sc["name"], "expected": kospi_ret, "actual": None, "pass": None, "note": f"측정불가(예외): {exc}"} for sc in _BACKTEST_SCENARIOS]
     idx_note = (f"코스피 기간수익률(pykrx, {kospi_meta.get('start_date')}~{kospi_meta.get('end_date')}) 대비 동일가중 유니버스, ±2.5%p. "
                 "코스피(시총가중 지수)와 동일가중 유니버스는 구성이 근본적으로 달라 큰 괴리가 정상." ) if kospi_meta else f"코스피 확보 실패로 전 시나리오 측정불가: {kospi_note}"
-    sections.append({"title": "5b. 코스피 지수 대비 동일가중 백테스트 (AC5b · ±2.5%p)",
+    sections.append({"title": "5b. 코스피 지수 대비 동일가중 백테스트 (AC5b · ±2.5%p)", "score": False,
         "headers": ["시나리오", "코스피(기대)", "백테스트(실제)", "판정/비고"], "items": index_res, "note": idx_note,
         "rows": [(r["scenario"], (f"{r['expected']*100:.2f}%" if r.get("expected") is not None else "-"),
                   (f"{r['actual']*100:.2f}%" if r.get("actual") is not None else "-"),
                   _verdict(r["pass"]) + (f" · {r['note']}" if r.get("note") else "")) for r in index_res]})
 
     conn.close()
-    REPORT_PATH.write_text(build_report(sections, kospi_note, kospi_meta, model_summary, errors), encoding="utf-8")
-    print(f"\n[완료] 리포트: {REPORT_PATH}")
-    tp = sum(1 for sec in sections for it in sec["items"] if it.get("pass") is True)
-    tf = sum(1 for sec in sections for it in sec["items"] if it.get("pass") is False)
-    tu = sum(1 for sec in sections for it in sec["items"] if it.get("pass") is None)
-    print(f"  종합: 전체 {tp+tf+tu}건 · pass {tp} · fail {tf} · 측정불가 {tu}")
+    report_path.write_text(build_report(sections, kospi_note, kospi_meta, model_summary, errors), encoding="utf-8")
+    print(f"\n[완료] 리포트: {report_path}")
+    scored_sections = [sec for sec in sections if sec.get("score", True)]
+    tp = sum(1 for sec in scored_sections for it in sec["items"] if it.get("pass") is True)
+    tf = sum(1 for sec in scored_sections for it in sec["items"] if it.get("pass") is False)
+    tu = sum(1 for sec in scored_sections for it in sec["items"] if it.get("pass") is None)
+    print(f"  종합(5b 코스피 비교 제외): 전체 {tp+tf+tu}건 · pass {tp} · fail {tf} · 측정불가 {tu}")
     print(f"  측정가능 기준 통과율: {_rate(tp, tp+tf)} ({tp}/{tp+tf})")
     print(f"  전체 항목 기준 통과율: {_rate(tp, tp+tf+tu)} ({tp}/{tp+tf+tu})")
+    for sec in sections:
+        if sec.get("avg_times") is not None:
+            print(f"  {sec['title']}: 평균응답시간 {_avg_time(sec['avg_times'])} ({len(sec['avg_times'])}건)")
+    all_llm_times = [t for sec in sections for t in sec.get("avg_times") or []]
+    print(f"  LLM 항목(1~4번) 전체 평균응답시간: {_avg_time(all_llm_times)} ({len(all_llm_times)}건)")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,6 @@
 
 - router_node가 통계/퀀트 질문을 route="pipeline"으로 감지(기존 detect_route와 같은
   '휴리스틱 키워드' 관례, 결정론 → 키 불필요).
-- goldset 50문항이 route="pipeline"으로 오분류되지 않는다(오탐 없음, 결정론).
 - sql_gen_node가 route=="pipeline"일 때 PIPELINE_USER로 파이프라인 JSON을 생성한다.
 - execute_node가 파이프라인을 실행해 결과 rows를 만든다.
 """
@@ -13,8 +12,6 @@ from pathlib import Path
 
 import pytest
 
-from src.config import CONFIG
-from src.eval.goldset import GOLDSET
 from src.legacy.graph.heuristic import detect_pipeline
 from src.legacy.graph.nodes import Deps, make_nodes
 from tests.conftest import FakeLLM
@@ -73,12 +70,6 @@ def test_detect_pipeline_true_for_strategy_search_questions(q):
     """search_strategy 프리미티브(10번째)가 PIPELINE_USER에 추가됐지만 라우팅 키워드
     갱신이 빠지면, 자연어 전략탐색 질문이 route="pipeline"으로 안 가는 버그가 재발한다."""
     assert detect_pipeline(q) is True
-
-
-def test_goldset_50_no_false_positive_pipeline_route():
-    """기존 goldset 50문항이 새 pipeline 경로로 새지 않아야 한다(결정론 회귀)."""
-    leaked = [item["id"] for item in GOLDSET if detect_pipeline(item["question"])]
-    assert leaked == []
 
 
 # --------------------------------------------------------------------------
@@ -196,12 +187,3 @@ def test_execute_does_not_generate_chart_for_non_backtest_result():
     }
     out = nodes["execute_node"](state)
     assert not out.get("chart_path")
-
-
-# --------------------------------------------------------------------------
-# 실측(키 있으면): 파마프렌치 테스트와 동일한 skipif 패턴
-# --------------------------------------------------------------------------
-@pytest.mark.skipif(not CONFIG.has_openai_key, reason="OpenAI 키 필요(README 관례: 키 없으면 스킵)")
-def test_goldset_no_pipeline_leak_is_deterministic_without_llm():
-    # detect_pipeline은 LLM을 쓰지 않으므로 키 유무와 무관하게 결정론이다(문서화용 확인).
-    assert all(not detect_pipeline(i["question"]) for i in GOLDSET)

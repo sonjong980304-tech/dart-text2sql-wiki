@@ -1,9 +1,7 @@
 """StateGraph 구성.
 
 흐름(기록 전용, 캐시 분기 없음):
-  START → refine → router → sql_gen → execute → record → (분기)
-    - do_eval : → eval → END
-    - else    : → END
+  START → refine → router → sql_gen → execute → record → END
 
 과거의 wiki_check(유사도 캐시 도출)/wiki_save(캐시 저장) 분기를 폐기했다.
 이제 모든 질의는 항상 새로 SQL을 생성·실행하고, 성공한 질의를 record 노드가
@@ -15,10 +13,6 @@ from langgraph.graph import END, START, StateGraph
 
 from .nodes import Deps, make_nodes
 from .state import GraphState
-
-
-def _branch_after_record(state: GraphState) -> str:
-    return "eval" if state.get("do_eval") else "end"
 
 
 def _route_after_diagnose(state: GraphState) -> str:
@@ -64,11 +58,6 @@ def build_graph(deps: Deps):
             "human": "human_review_node",  # 데이터 문제/3회 초과 → 사람 검토
         },
     )
-    g.add_conditional_edges(
-        "record_node",
-        _branch_after_record,
-        {"eval": "eval_node", "end": END},
-    )
+    g.add_edge("record_node", END)
     g.add_edge("human_review_node", END)
-    g.add_edge("eval_node", END)
     return g.compile()

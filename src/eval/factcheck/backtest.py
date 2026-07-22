@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 from ...db import connect
-from ..runner import _cleanup_copy, _isolated_copy
+from ..db_isolation import _cleanup_copy, _isolated_copy
 from .tolerance import within_pct_tolerance
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]

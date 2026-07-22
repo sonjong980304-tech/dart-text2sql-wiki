@@ -35,11 +35,6 @@ class GraphState(TypedDict, total=False):
     error: Optional[str]
     audit_warnings: List[Dict[str, Any]]  # 백테스트 감사 소프트경고(감지된 위험) — cli가 결과 아래 첨부
 
-    # 평가
-    gold_sql: str              # 정답 SQL (평가 모드에서만)
-    do_eval: bool              # eval 노드 실행 여부
-    evaluation: Dict[str, Any]
-
     # 진단 (diagnose_node)
     attempt_count: int         # sql_gen 생성 횟수 (그래프 루프 재시도 한도용)
     expected_count: Optional[int]  # 질문/SQL이 기대한 결과 개수

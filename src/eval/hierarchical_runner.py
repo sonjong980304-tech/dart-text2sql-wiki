@@ -1,18 +1,15 @@
 """신규 계층형 아키텍처(run_hierarchical) 용 goldset 재실행 러너 (HA-14, AC18/AC20).
 
-기존 legacy 평가(src/eval/runner.py.run_evaluation)는 손대지 않는다 — 그것이 'legacy
-baseline' 역할을 그대로 유지한다(레거시 6단계 파이프라인 기준 EX 정확도). 이 파일은 같은
-goldset 을 **신규 계층형 그래프(run_hierarchical)** 로 재실행하고, 그 결과를 정답 SQL 실행
-결과와 대조해 정확도를 매기는 별도 신규 경로다.
+이 파일은 goldset 을 **신규 계층형 그래프(run_hierarchical)** 로 재실행하고, 그 결과를
+정답 SQL 실행 결과와 대조해 정확도를 매긴다.
 
 판정 방식(AC18):
-  legacy 는 결과셋 denotation 비교(evaluator.compare_resultsets)가 가능하지만, 신규 구조의
-  산출물은 결과셋이 아니라 종합결론(conclusion) + 도메인별 원본결과(domain_results)라 직접
-  행 비교가 불가능하다. 그래서 기존 Layer2(LLM judge, evaluator.eval_layer2) 프롬프트 스타일을
-  재사용해 "정답 SQL 실행 결과"와 "신규 구조 답변"의 일치 여부를 LLM 에게 판정시킨다.
+  신규 구조의 산출물은 결과셋이 아니라 종합결론(conclusion) + 도메인별 원본결과
+  (domain_results)라 직접 행 비교가 불가능하다. 그래서 LLM judge 프롬프트 스타일로
+  "정답 SQL 실행 결과"와 "신규 구조 답변"의 일치 여부를 LLM 에게 판정시킨다.
 
-원본 DB 보호(AC18): 평가는 항상 원본 DB 의 격리 사본(runner._isolated_copy)에서 실행한다 —
-새로 발명하지 않고 기존 온라인 백업 패턴을 그대로 import 해서 쓴다.
+원본 DB 보호(AC18): 평가는 항상 원본 DB 의 격리 사본(db_isolation._isolated_copy)에서
+실행한다.
 
 성능 실측(AC20): count_llm_calls 로 llm_fn 호출 횟수를 세고, 문항별 응답시간을 측정한다.
 """
@@ -23,7 +20,7 @@ from typing import Any, Callable
 
 from ..llm import extract_json
 from ..sql_exec import run_select
-from .runner import _cleanup_copy, _isolated_copy
+from .db_isolation import _cleanup_copy, _isolated_copy
 
 
 class CountingLLM:

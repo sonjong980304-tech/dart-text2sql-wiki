@@ -46,10 +46,8 @@ class Pipeline:
         )
         self.graph = build_graph(self.deps)
 
-    def run(self, question: str, do_eval: bool = False, gold_sql: str | None = None) -> dict:
-        init: dict = {"raw_question": question, "do_eval": do_eval, "notes": []}
-        if gold_sql:
-            init["gold_sql"] = gold_sql
+    def run(self, question: str) -> dict:
+        init: dict = {"raw_question": question, "notes": []}
         return self.graph.invoke(init)
 
     def close(self) -> None:

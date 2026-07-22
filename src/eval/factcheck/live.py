@@ -250,15 +250,18 @@ def make_vision_fn(vision_client=None, model: str | None = None) -> Callable[[st
     return _fn
 
 
-def build_system_llm_fn(role: str = "sql"):
-    """실제 시스템 텍스트 LLM(Callable[[str],str]). 미가용(키 없음) 시 None.
+def build_system_llm_fn(role: str = "sql", model: str | None = None):
+    """실제 시스템 텍스트 LLM(Callable[[str],str]). 미가용(키 없음/데몬 없음) 시 None.
 
     scripts/eval_hierarchical_goldset._build_llm_fn 과 동일 규약 — run_hierarchical 에
-    주입하는 SQL 생성/판정용 llm_fn 이다.
+    주입하는 SQL 생성/판정용 llm_fn 이다. model을 주면(예: "exaone3.5:7.8b") 시스템 기본
+    설정(.env) 대신 그 모델을 강제한다 — scripts/eval_model_comparison.py의
+    _llm_fn_for와 동일한 override 규약(LLMClient(model=...)이 gpt* 접두면 openai,
+    아니면 ollama로 자동 라우팅).
     """
     from src.llm import LLMClient
 
-    client = LLMClient()
+    client = LLMClient(model=model) if model else LLMClient()
     if not client.available:
         return None
     return lambda prompt: (client.complete(prompt, role=role).text or "")
