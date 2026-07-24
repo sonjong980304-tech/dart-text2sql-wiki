@@ -203,7 +203,8 @@ vision 판정과 대조하였습니다.
 | 파일 | 역할 |
 |---|---|
 | `supervisor.py` | 총괄 — 라우팅(`route_question`)→도메인 실행(`dispatch_domains`)→정합성 검증(`verify_answer`)→최대 2회 재시도→종합결론(`answer_with_verification` 하나로 통합). |
-| `graph.py` | 총괄 함수를 LangGraph `StateGraph` 노드로 감싸 `.stream()`으로 실행 — 자세한 노드 구조는 아래 "노드별" 참고. |
+| `graph.py` | 총괄 함수를 LangGraph `StateGraph` 노드(단일 `supervisor`)로 감싸 `.stream()`으로 실행 — 진행 이벤트를 `get_stream_writer()` 표준 스트리밍으로 방출. 자세한 노드 구조는 아래 "노드별" 참고. |
+| `supervisor_graph.py` | 총괄 오케스트레이션을 실제 다중 노드 `StateGraph`로 구현(router→도메인 병렬 fan-out→verify→실패 도메인만 재시도/폴백→synthesize→chart 조건부). `answer_with_verification`이 내부에서 빌드·실행. |
 | `domain_kr.py` | 한국 종목 — 단일/비교/스크리닝 3갈래 분기. 단일·비교 경로에서는 다시 질문을 재무·순수 시세·기술지표로 분류(`classify_intent`)해 필요한 축만(또는 여럿) 호출. "SK하이닉스"뿐 아니라 "하이닉스" 같은 구어체 약칭도 실재 회사면 인식. |
 | `domain_macro.py` | 매크로 — 재계산 없이 배치가 미리 적재한 `macro_signal` 최신 1행만 읽음. |
 | `domain_backtest.py` | 전략 백테스트·팩터분석 — LLM이 파이썬을 직접 안 쓰고 `{"pipeline":[...]}` JSON 조립 지시서만 생성, 실행은 별도 검증된 엔진이 담당. 종료연도를 질문에 안 밝히면 오늘이 속한 연도를 기본값으로 쓴다. |
@@ -217,7 +218,10 @@ vision 판정과 대조하였습니다.
 | `charting.py` | 히스토그램·막대·산점도·라인 4종 렌더 헬퍼(참고용 옵션 — `chart_agent`가 원하면 가져다 쓰고, 아니면 matplotlib을 직접 씀). |
 
 #### 노드별 — LangGraph 그래프 구조
-현재(신규) 계층형 그래프(`src/agents/graph.py`)는 **의도적으로 노드가 하나**입니다: `START → supervisor → END`. 라우팅·도메인실행·검증·재시도는 전부 이 `supervisor` 노드 **안에서** `answer_with_verification` 함수 호출로 처리됩니다(도메인마다 그래프 노드를 쪼개지 않음 — 스트리밍 이벤트가 노드 완료 시점마다 나오면 충분했기 때문). `.stream()`으로 실행해 노드가 끝날 때마다 `{"step": "supervisor", "summary": "..."}` 진행 이벤트를 방출하고, `run_streaming`이 이걸 별도 스레드+큐로 실시간화해 SSE로 흘려보냅니다.
+계층형 실행은 **두 겹의 그래프**로 되어 있습니다.
+
+1. **바깥 감싸개(`src/agents/graph.py`)** — 노드가 하나인 얇은 래퍼입니다: `START → supervisor → END`. 이 `supervisor` 노드가 아래 `answer_with_verification`를 호출하고 `.stream()`으로 실행해 진행 이벤트(`{"step": "...", "summary": "..."}`)를 방출합니다. 스트리밍은 예전의 커스텀 스레드+큐 배선을 걷어내고 LangGraph 표준(`get_stream_writer()` + `stream_mode="custom"`)으로 바꿔, 노드가 끝난 뒤가 아니라 **실행 도중**에 진행 이벤트가 실시간으로 SSE로 흘러갑니다.
+2. **총괄 다중 노드 그래프(`src/agents/supervisor_graph.py`)** — `answer_with_verification` 안에서 실제로 도는 진짜 `StateGraph`입니다. 예전엔 이 오케스트레이션이 순수 파이썬 for 루프였지만, 이제 다이어그램 그대로 노드로 쪼개져 있습니다: `START → router(라우팅) → dispatch_gate → (한국주식·매크로·백테스트 노드 중 라우팅된 것만 병렬 fan-out) → verify(검증) → [검증 실패 시 실패한 도메인만 재-dispatch(최대 2회) · 그래도 실패면 backtest 추가시도 1회 또는 자유 코드 폴백] → synthesize(종합결론) → chart(차트 요청 시 조건부) → END`. 도메인 노드들은 같은 superstep에서 LangGraph가 스레드로 동시에 실행하고, `dispatch_domains`도 `ThreadPoolExecutor`로 도메인들을 **실제 병렬** 호출합니다. 검증에 실패하면 통과한 도메인 결과는 보존하고 **실패한 도메인만** 다시 부릅니다(전체 재실행 아님).
 
 ---
 
@@ -295,7 +299,7 @@ ROE/ROA/ROC/마진/성장률 등 전체 지표를 그 시점 기준으로 즉석
 
 | 계층 | 파일 | 하는 일 |
 |---|---|---|
-| 총괄 | `supervisor.py` | `route_question`(질문을 보고 kr/macro/backtest 중 몇 개 도메인이 필요한지 결정 — LLM 우선, 실패 시 키워드 휴리스틱) → `dispatch_domains`(해당 도메인들을 호출해 원본 결과를 **가공 없이** 보존) → `verify_answer`(도메인 결과가 원래 질문에 실제로 답이 되는지 규칙+LLM으로 재확인) → 불일치면 실패 사유를 피드백해 **최대 2회(`max_retries` 기본값)**까지만 재도전 → `synthesize_conclusion`(종합 결론 문장 생성). 재시도를 모두 소진해도 실패하면 그제서야 아래 exec_fallback을 정확히 1회 시도합니다. |
+| 총괄 | `supervisor.py` | `route_question`(질문을 보고 kr/macro/backtest 중 몇 개 도메인이 필요한지 결정 — LLM 우선, 실패 시 키워드 휴리스틱) → `dispatch_domains`(라우팅된 도메인들을 `ThreadPoolExecutor`로 **병렬** 호출해 원본 결과를 **가공 없이** 보존) → `verify_answer`(도메인 결과가 원래 질문에 실제로 답이 되는지 규칙+LLM으로 재확인) → 불일치면 실패 사유를 피드백해 **최대 2회(`max_retries` 기본값)**까지만 재도전(통과한 도메인 결과는 보존하고 **실패한 도메인만** 다시 실행) → `synthesize_conclusion`(종합 결론 문장 생성). 재시도를 모두 소진해도 실패하면 그제서야 아래 exec_fallback을 정확히 1회 시도합니다. |
 | 도메인 | `domain_kr.py` | 국내 종목. 질문을 단일종목/다중종목(비교질문)/스크리닝(조건검색) 3갈래로 나눕니다. 단일·다중종목 경로에서는 다시 `classify_intent`가 질문을 **재무·순수 시세·기술지표** 세 축으로 분류해(LLM 우선, 실패 시 키워드 폴백; 여러 축이면 여러 하위 에이전트를 함께 호출) 필요한 데이터만 조회합니다 — 재무는 `data_financial.py`, 순수 시세는 `data_price_kr.py`, 기술지표(이동평균/RSI/MACD/볼린저)는 `data_price_kr.py`가 `compute_technical_indicator`(TA-Lib, `src/backtest/primitives.py`)로 계산해 시세에 부착합니다. 스크리닝은 LLM이 "PER 낮은 순 10개"처럼 **조건(criteria)·개수(top_n)만 JSON으로 뽑고**, 실제 정렬·계산은 `get_cross_section`+`combine`이 결정론적으로 수행합니다(LLM이 숫자를 직접 계산하지 않음 — 계산은 항상 코드가, 판단만 LLM이). 종목명 인식은 "SK하이닉스"처럼 공식명 전체 언급뿐 아니라 "하이닉스"같이 그룹·지주 접두어(SK/LG/삼성 등)를 생략한 구어체도, company 테이블에 실재하는 회사일 때만 후보로 인정하는 방식으로 지원합니다. |
 | 도메인 | `domain_macro.py` | **재계산을 하지 않습니다** — launchd로 매일 미리 계산·적재된 `macro_signal` 테이블의 최신 1행을 읽어오기만 합니다(질문이 들어올 때마다 신호를 다시 판정하면 매번 값이 흔들릴 수 있어, "판단은 배치로 1회, 조회는 캐시만"이라는 이 프로젝트 공통 원칙을 여기서도 씁니다). |
 | 도메인 | `domain_backtest.py` | 전략 백테스트·팩터분석(상관관계/분위수/히스토그램/QVM 등)을 담당합니다. LLM이 파이썬을 쓰지 않고 `{"pipeline":[{"op":..., "params":..., "out":...}]}` 형태의 **JSON 조립 지시서**만 생성하면(`generate_backtest_steps`), 그 JSON을 먼저 정적 검증(`validate_pipeline_steps` — 존재하지 않는 연산·파라미터 거부)한 뒤 `pipeline_exec.run_pipeline`이 실제 계산을 수행합니다. |
@@ -388,6 +392,7 @@ quant-assistant/
 │   ├── agents/                    # 신규 계층형 멀티에이전트 (웹이 사용)
 │   │   ├── graph.py               # LangGraph StateGraph 감싸기 (run_hierarchical/run_streaming)
 │   │   ├── supervisor.py          # 라우팅 + 정합성검증 + 재시도(answer_with_verification)
+│   │   ├── supervisor_graph.py    # 총괄 오케스트레이션 다중 노드 그래프(router→도메인 병렬 fan-out→verify→폴백→synthesize)
 │   │   ├── domain_kr.py / domain_macro.py / domain_backtest.py
 │   │   ├── data_financial.py      # DART/FnGuide 재무 데이터 에이전트
 │   │   ├── data_price_kr.py       # 주가·기술지표 데이터 에이전트
@@ -557,7 +562,7 @@ quant_trader와 동일한 텔레그램 채널로 알림 발송(직전 달 대비
 | `fnguide_metrics` | 종목코드, 지표, 시점 — DART에 없는 컨센서스/목표주가 등 (FnGuide) |
 | `prices` | 종목코드, 날짜, 종가, 시가총액 (KRX+네이버 병합, 단일 소스) |
 | `daily_shares` | 종목코드, 날짜별 상장주식수(pykrx) — 시가총액 시점별 정확화(`_shares_outstanding_at`)용 |
-| `metrics` | 종목코드, 기준분기, 종가날짜, PER/PBR/ROE/영업이익률/부채비율 등 파생 지표 — **최신 한 분기 스냅샷만 유지**(과거분기 이력 아님). 과거 시점 조회는 "과거 시점(분기·연도) 재무지표 조회" 절 참고 |
+| `metrics` | 종목코드, 기준분기, 종가날짜, PER/PBR/ROE/영업이익률/부채비율 등 파생 지표 — **최신 한 분기 스냅샷만 유지**(과거분기 이력 아님). 종가날짜(가격 기준일)는 매일 주가 갱신 때 `compute_metrics`가 함께 돌아 최신 주가를 따라감. 과거 시점 조회는 "과거 시점(분기·연도) 재무지표 조회" 절 참고 |
 | `metric_def` | 지표명, 컬럼명, 방향(높을수록/낮을수록 우수), 카테고리 — 백테스트 UI 자동 생성용 |
 | `delisting` | 종목코드, 상장폐지일 — 백테스트 생존편향 제거용(상폐 종목도 유니버스에 유지) |
 | `kr_trading_status` | 관리종목·거래정지 현재 상태(KRX 스냅샷 관측 기반, status_type='admin'\|'halt') |
@@ -605,7 +610,7 @@ DART 일일 조회 한도 때문에 "매일 전부 다시 받기"가 아니라, 
 | 신규상장 종목 재무 백필 | 매일 02:00/10:00/15:00 (하루 3회) | `scripts/backfill_full.py` |
 | 분기 공시 증분 체크 | 매일 아침 7시30분 | `scripts/update_financials.py` |
 | KRX 업종분류 재동기화 | 매월 1일 | `scripts/backfill_sector_krx.py` |
-| 국내 주가/시총 | 매일 | `scripts/update_prices.py`, `scripts/run_naver_prices.py` |
+| 국내 주가/시총 (+ PER/PBR·ROE 등 `metrics` 재계산) | 매일 | `scripts/update_prices.py`, `scripts/run_naver_prices.py` |
 | 상장주식수(당일) | 매일 03:00/13:00 (하루 2회) | `scripts/backfill_shares.py` |
 | 상장주식수(일별 이력) | 매일 06:00 | `scripts/backfill_shares_daily.py` |
 | 관리종목·거래정지 현황 | 매일 19:00 | `scripts/run_kr_trading_status.py` |
