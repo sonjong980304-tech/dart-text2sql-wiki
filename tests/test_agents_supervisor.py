@@ -219,7 +219,9 @@ def test_dispatch_domains_routes_macro_and_backtest(monkeypatch):
         ["macro", "backtest"], "매크로 신호로 백테스트", conn=None, llm_fn=None, steps=[{"op": "noop"}]
     )
 
-    assert calls == ["macro", "backtest"]
+    # 병렬 실행이라 호출 순서는 비결정적이지만, 두 도메인이 각각 정확히 한 번씩 실행돼
+    # 올바른 키로 원본 결과가 보존되는지를 검증한다(순서가 아니라 '무엇이 실행됐는지'가 취지).
+    assert sorted(calls) == ["backtest", "macro"]
     assert out["macro"] == {"overall": "RED"}
     assert out["backtest"] == {"blocked": False, "result": {"cagr": 0.1}}
 
@@ -278,6 +280,37 @@ def test_dispatch_domains_absorbs_domain_exception(monkeypatch):
     assert "kr" in out
     assert "error" in out["kr"]
     assert "도메인 폭발" in out["kr"]["error"] or "RuntimeError" in out["kr"]["error"]
+
+
+def test_dispatch_domains_runs_domains_in_parallel(monkeypatch):
+    """두 도메인이 실제로 동시에 실행됨을 threading.Barrier로 결정론적으로 증명한다.
+
+    Barrier(2)는 두 스레드가 모두 wait()에 도달해야만 통과한다. 병렬 실행이면 kr/macro가
+    각자 스레드에서 동시에 도달해 즉시 통과하지만, 순차 실행이면 먼저 실행된 도메인이
+    두 번째 도메인이 시작조차 못 한 채 홀로 wait()에 걸려 timeout(BrokenBarrierError)이
+    나고, dispatch가 그 예외를 흡수해 결과가 {"error": ...}가 되므로 아래 단언이 실패한다.
+    즉 이 테스트가 통과한다는 것 자체가 두 도메인이 동시에 살아 있었다는 증거다."""
+    import threading
+
+    import src.agents.supervisor as sup
+
+    barrier = threading.Barrier(2, timeout=5)
+
+    def kr_waits(question, conn, llm_fn=None, on_progress=None):
+        barrier.wait()
+        return {"stock_code": "005930", "financial": {"value": 1.0}}
+
+    def macro_waits(question, conn, **k):
+        barrier.wait()
+        return {"available": True, "overall": "GREEN"}
+
+    monkeypatch.setattr(sup, "answer_kr_question", kr_waits)
+    monkeypatch.setattr(sup, "answer_macro_question", macro_waits)
+
+    out = dispatch_domains(["kr", "macro"], "삼성전자 매크로 신호", conn=None, llm_fn=None)
+
+    assert out["kr"] == {"stock_code": "005930", "financial": {"value": 1.0}}
+    assert out["macro"] == {"available": True, "overall": "GREEN"}
 
 
 # ── AC2: verify_answer — 도메인 결과와 원 질문의 정합성 판정 ───────────────────

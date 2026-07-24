@@ -1387,24 +1387,84 @@ def _parse_recent_return_months(question: str) -> int | None:
 _MONTH_DAY_RE = re.compile(r"(?<!\d)(\d{1,2})\s*월\s*(\d{1,2})\s*일")
 
 
-def _parse_price_target_date(question: str, today: date | None = None) -> str | None:
+def _price_date_llm_prompt(question: str, today: date) -> str:
+    """_parse_price_target_date LLM 우선 판단용 프롬프트. classify_intent의 _intent_prompt와
+    동일 관례(LLM 우선 → 실패 시 정규식 폴백).
+
+    정규식(_MONTH_DAY_RE + _YEAR_*_RE)은 질문 전체에서 "연도"를 검색해 첫 매치를 그냥
+    집기 때문에, 한 질문에 서로 다른 목적의 연도가 여러 번 나오면(예: "25년 3분기
+    영업이익과 26년 7월 24일 종가") 실제로 "7월 24일"에 붙은 "26년"이 아니라 문장 앞의
+    "25년"을 엉뚱하게 집어버린다(실서버 재현: 2026-07-24 요청이 2025-07-24로 조회됨).
+    LLM은 사람처럼 "어느 연도가 어느 날짜를 수식하는지" 문맥으로 판단할 수 있어 이 프롬프트로
+    먼저 물어보고, 실패/미가용 시에만 기존 정규식으로 폴백한다.
+    """
+    return (
+        f"오늘은 {today.isoformat()}입니다.\n"
+        "다음 질문에서 '주가/시세/종가/시가/고가/저가/거래량' 등 가격 조회 대상이 되는 "
+        "특정 날짜가 언급되어 있으면 YYYY-MM-DD 형식으로만 답하세요.\n"
+        "질문에 서로 다른 목적의 연도가 여러 번 나올 수 있습니다(예: 재무 분기용 연도와 "
+        "주가 조회용 연도가 다름) — 가격 조회 대상 날짜(월-일)에 실제로 붙어 있는 연도만 "
+        "사용하세요. 그 날짜에 연도가 붙어 있지 않으면 오늘이 속한 연도를 쓰세요.\n"
+        "가격 조회용 특정 날짜가 전혀 없으면 NONE이라고만 답하세요.\n\n"
+        f"질문: {question}\n답:"
+    )
+
+
+_LLM_DATE_TOKEN_RE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+
+
+def _parse_llm_target_date(raw: str | None) -> str | None:
+    """LLM 응답에서 YYYY-MM-DD를 뽑아 ISO 문자열로 반환한다.
+
+    'NONE'/빈 응답/형식이 다른 응답/달력상 존재하지 않는 날짜는 모두 None → 호출부가
+    기존 정규식 경로로 폴백(_parse_intent가 불명확 응답을 None으로 돌려 키워드 폴백을
+    태우는 것과 동일 관례).
+    """
+    if not raw:
+        return None
+    m = _LLM_DATE_TOKEN_RE.search(raw)
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+    except ValueError:
+        return None
+
+
+def _parse_price_target_date(
+    question: str,
+    today: date | None = None,
+    llm_fn: Callable[[str], str] | None = None,
+) -> str | None:
     """질문에서 "특정일자(연도 없는 월-일 포함)"를 'YYYY-MM-DD' 문자열로 파싱한다. 없으면 None.
 
-    - "6월 18일"(연도 미명시) → 오늘이 속한 연도의 6월 18일(domain_backtest의 "오늘이 속한
-      연도 기본값" 규칙과 동일). 그 시점 이하 가장 가까운 과거 거래일 폴백은 조회 단계
-      (get_latest_price_kr, date<=asof)가 담당하므로 여기서는 달력 날짜만 만든다.
-    - "2025년 6월 18일" / "25년 6월 18일"(연도 명시) → 그 연도의 6월 18일.
-    - "월-일"이 없으면(순수 시세 "주가 알려줘" 등) None → 호출부가 기존 최신값 경로 유지.
-    - 존재하지 않는 날짜(예: 2월 30일)는 None(달력 검증).
+    - llm_fn이 주어지면 먼저 LLM에 판단을 위임한다(_price_date_llm_prompt) — 한 질문에
+      여러 연도가 나올 때 "어느 연도가 이 날짜에 붙는지"를 문맥으로 정확히 판단하기
+      위함이다. LLM이 유효한 날짜를 돌려주면 그 값을 그대로 쓴다.
+    - LLM이 없거나(llm_fn=None) 실패/예외/미파싱 응답이면 기존 정규식 경로로 폴백한다:
+      - "6월 18일"(연도 미명시) → 오늘이 속한 연도의 6월 18일(domain_backtest의 "오늘이
+        속한 연도 기본값" 규칙과 동일). 그 시점 이하 가장 가까운 과거 거래일 폴백은 조회
+        단계(get_latest_price_kr, date<=asof)가 담당하므로 여기서는 달력 날짜만 만든다.
+      - "2025년 6월 18일" / "25년 6월 18일"(연도 명시) → 그 연도의 6월 18일.
+      - "월-일"이 없으면(순수 시세 "주가 알려줘" 등) None → 호출부가 기존 최신값 경로 유지.
+      - 존재하지 않는 날짜(예: 2월 30일)는 None(달력 검증).
 
     호출부는 재시도 피드백이 섞이지 않도록 _strip_retry_feedback을 거친 원본 질문을 넘긴다.
     """
     q = question or ""
+    today = today or date.today()
+    if llm_fn is not None:
+        try:
+            raw = llm_fn(_price_date_llm_prompt(q, today)) or ""
+        except Exception:  # noqa: BLE001 — LLM 실패는 정규식 폴백으로 흡수
+            raw = ""
+        llm_date = _parse_llm_target_date(raw)
+        if llm_date is not None:
+            return llm_date
     m = _MONTH_DAY_RE.search(q)
     if m is None:
         return None
     month, day = int(m.group(1)), int(m.group(2))
-    today = today or date.today()
     ym = _YEAR_FULL_RE.search(q)
     if ym:
         year = int(ym.group(1))
@@ -1894,7 +1954,7 @@ def _answer_kr_multi_entity_question(
             price_asof = _resolve_screening_asof(period, conn, "prices", execute_sql_fn)
             # "6월 18일" 특정일자(연도 없는 월-일 포함) 지목 시 그 날짜를 asof로 우선한다
             # (단일종목 경로와 동일 — 연도 미명시면 오늘이 속한 연도 기본값).
-            target_date = _parse_price_target_date(base_question, today=today)
+            target_date = _parse_price_target_date(base_question, today=today, llm_fn=llm_fn)
             if target_date is not None:
                 price_asof = target_date
             price, err = _call_with_retry(
@@ -2227,7 +2287,7 @@ def answer_kr_question(
         # "6월 18일"처럼 특정일자(연도 없는 월-일 포함)를 지목하면 그 날짜를 asof로 쓴다
         # (연도 미명시 시 오늘이 속한 연도 기본값). period 기반 asof(연간=말일)보다 우선한다 —
         # get_price_snapshot_kr의 date<=asof가 그 시점 이하 가장 가까운 과거 거래일을 고른다.
-        target_date = _parse_price_target_date(base_question, today=today)
+        target_date = _parse_price_target_date(base_question, today=today, llm_fn=llm_fn)
         if target_date is not None:
             price_asof = target_date
         price, err = _call_with_retry(

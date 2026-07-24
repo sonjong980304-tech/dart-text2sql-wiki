@@ -131,3 +131,19 @@ if __name__ == "__main__":
             backfill_marketcap()
         except Exception as exc:  # noqa: BLE001 — 시총 백필 실패는 주가 갱신을 무효화하지 않는다
             print(f"시총 백필 스킵: {exc}")
+
+        # metrics(PER/PBR/ROE 등 사전계산 테이블)도 최신 주가 기준으로 갱신한다. 예전엔
+        # refeed_full.py/swap_refeed.py(수동 재수집)에서만 compute_metrics가 호출돼, 일별
+        # 자동 갱신 흐름을 안 타 PER 조회 기준일이 며칠씩 뒤처졌다(실서버 재현: prices는
+        # 최신인데 metrics.price_date만 3거래일 전에 멈춰 PER이 오래된 값으로 나옴).
+        try:
+            from src.ingest.metrics import compute_metrics
+
+            metrics_conn = connect()
+            try:
+                n_metrics = compute_metrics(metrics_conn)
+                print(f"metrics 재계산 {n_metrics}종목")
+            finally:
+                metrics_conn.close()
+        except Exception as exc:  # noqa: BLE001 — metrics 재계산 실패는 주가 갱신을 무효화하지 않는다
+            print(f"metrics 재계산 스킵: {exc}")

@@ -21,6 +21,8 @@ from src.agents.graph import (
     run_streaming,
     supervisor_node,
 )
+from src.agents.supervisor import answer_with_verification
+from src.agents.supervisor_graph import build_supervisor_graph
 
 
 # 라우팅/검증/종합 3종 프롬프트를 프롬프트 내용으로 구분해 응답하는 mock LLM.
@@ -249,6 +251,42 @@ def test_run_streaming_emits_supervisor_event(monkeypatch):
     assert "통과" in events[-1]["summary"]
 
 
+def test_run_streaming_emits_events_for_each_routed_domain(monkeypatch):
+    """복합 라우팅(kr+macro)에서 라우팅 확정 → 각 도메인 시작/완료 → 검증 결과가 모두 새
+    스트리밍 경로(get_stream_writer + stream_mode='custom')로 방출되는지 검증한다.
+
+    도메인 실행이 병렬이라 kr/macro 진행 이벤트의 상대 순서는 섞일 수 있지만, 라우팅 확정은
+    항상 처음, 검증 결과는 항상 마지막이라는 골격(원래 검증 취지)은 유지된다. 두 도메인의
+    진행 이벤트가 모두 나타나는지를 함께 확인해, 병렬 dispatch의 통지가 하나도 유실되지 않고
+    실시간 스트림에 실림을 증명한다."""
+    import src.agents.supervisor as sup
+
+    monkeypatch.setattr(
+        sup, "answer_kr_question",
+        lambda question, conn, llm_fn=None, on_progress=None: {"stock_code": "005930", "financial": {"value": 12.5}},
+    )
+    monkeypatch.setattr(
+        sup, "answer_macro_question",
+        lambda question, conn, **k: {"available": True, "overall": "GREEN"},
+    )
+
+    def kr_macro_llm(prompt: str) -> str:
+        if "도메인 키워드만" in prompt:   # route_question 프롬프트
+            return "kr, macro"
+        if "valid" in prompt:             # verify_answer 프롬프트
+            return '{"valid": true, "reason": "부합"}'
+        return "삼성전자 재무 + 매크로 종합 결론"
+
+    events = list(run_streaming("삼성전자 PER과 매크로 신호", conn=None, llm_fn=kr_macro_llm))
+    steps = [e["step"] for e in events]
+
+    assert steps[0] == "supervisor"                              # 라우팅 확정이 처음
+    assert "한국" in events[0]["summary"] and "매크로" in events[0]["summary"]
+    assert "kr" in steps and "macro" in steps                    # 두 도메인 모두 이벤트 방출
+    assert steps[-1] == "verify"                                 # 검증 결과가 마지막
+    assert "통과" in events[-1]["summary"]
+
+
 def test_collect_stream_matches_run_streaming(monkeypatch):
     _seed_valid_domains(monkeypatch)
     collected = collect_stream("삼성전자 vs 애플 비교", conn=None, llm_fn=_multi_domain_fake_llm)
@@ -321,3 +359,146 @@ def test_run_streaming_without_out_final_keeps_default_behavior(monkeypatch):
     _seed_valid_domains(monkeypatch)
     events = list(run_streaming("삼성전자 vs 애플 비교", conn=None, llm_fn=_multi_domain_fake_llm))
     assert events and events[0]["step"] == "supervisor"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 2 — answer_with_verification 내부의 진짜 다중 노드 그래프(supervisor_graph)
+# 노드 = 라우터/kr/macro/backtest(팬아웃, 병렬)/검증/폴백/종합결론/차트(조건부),
+# 검증 실패 시 실패한 도메인 노드로만 되돌아가는 순환 엣지.
+# (answer_with_verification의 외부 계약 자체는 tests/test_agents_supervisor.py가
+# 무수정으로 전부 검증한다 — 여기서는 그래프 구조/팬아웃 고유 동작만 추가 검증.)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_minimal_supervisor_graph(**overrides):
+    """구조 검사용 최소 인자 조립 헬퍼(모든 로직 함수는 결정론 스텁)."""
+    kwargs = dict(
+        conn=None, llm_fn=None, max_retries=2,
+        route_fn=lambda q, l: ["kr"],
+        dispatch_fn=lambda routes, q, conn, llm_fn, steps=None: {"kr": {}},
+        verify_fn=lambda q, dr, l: {"valid": True, "reason": "ok"},
+        synthesize_fn=lambda q, dr, l: "결론",
+        fallback_fn=lambda q, c, l, r=None: {"ok": False},
+        chart_fallback_fn=lambda q, d, l: None,
+        chart_llm_fn=None,
+        wants_chart_fn=lambda q: False,
+        chartable_payload_fn=lambda dr: dr,
+        use_domain_fanout=False,
+    )
+    kwargs.update(overrides)
+    return build_supervisor_graph(**kwargs)
+
+
+def test_supervisor_graph_registers_diagram_nodes():
+    """다이어그램의 단계들이 전부 **진짜 그래프 노드**로 등록된다(단일 노드 감싸기가 아님)."""
+    graph = _build_minimal_supervisor_graph()
+    node_names = set(graph.get_graph().nodes)
+    for expected in ("router", "dispatch_gate", "kr", "macro", "backtest",
+                     "verify", "fallback", "synthesize", "chart"):
+        assert expected in node_names
+
+
+def test_supervisor_graph_fanout_runs_domain_nodes_in_parallel(monkeypatch):
+    """팬아웃 모드(dispatch_fn 미주입)에서 kr/macro 도메인 **노드**가 같은 superstep에서
+    동시에 실행됨을 threading.Barrier로 결정론적으로 증명한다
+    (test_dispatch_domains_runs_domains_in_parallel과 동일 기법 — 순차 실행이면 먼저 실행된
+    도메인이 홀로 wait()에 걸려 timeout이 나므로 이 테스트 통과 자체가 병렬성의 증거다)."""
+    import threading
+
+    import src.agents.supervisor as sup
+
+    barrier = threading.Barrier(2, timeout=5)
+
+    def kr_waits(question, conn, llm_fn=None, on_progress=None):
+        barrier.wait()
+        return {"stock_code": "005930", "financial": {"value": 1.0}}
+
+    def macro_waits(question, conn, **k):
+        barrier.wait()
+        return {"available": True, "overall": "GREEN"}
+
+    monkeypatch.setattr(sup, "answer_kr_question", kr_waits)
+    monkeypatch.setattr(sup, "answer_macro_question", macro_waits)
+
+    res = answer_with_verification(
+        "삼성전자 PER과 매크로 신호", conn=None, llm_fn=None,
+        route_fn=lambda q, l: ["kr", "macro"],
+        verify_fn=lambda q, dr, l: {"valid": True, "reason": "일치"},
+    )
+
+    assert res["uncertain"] is False
+    assert res["domain_results"]["kr"] == {"stock_code": "005930", "financial": {"value": 1.0}}
+    assert res["domain_results"]["macro"] == {"available": True, "overall": "GREEN"}
+
+
+def test_supervisor_graph_fanout_cycles_back_to_failed_domain_only(monkeypatch):
+    """검증 실패 시 순환 엣지(verify→dispatch_gate)가 **실패한 도메인 노드만** 다시 실행하고
+    (kr 1회, macro 2회), 재시도 질문에는 실패 사유 피드백이 주입된다."""
+    import src.agents.supervisor as sup
+
+    kr_questions: list[str] = []
+    macro_questions: list[str] = []
+
+    def fake_kr(question, conn, llm_fn=None, on_progress=None):
+        kr_questions.append(question)
+        return {"stock_code": "005930", "financial": {"value": 12.5}}
+
+    def fake_macro(question, conn, **k):
+        macro_questions.append(question)
+        return {"available": True, "overall": "GREEN"}
+
+    monkeypatch.setattr(sup, "answer_kr_question", fake_kr)
+    monkeypatch.setattr(sup, "answer_macro_question", fake_macro)
+
+    per_domain_by_attempt = iter([
+        {"kr": {"valid": True, "reason": "일치"}, "macro": {"valid": False, "reason": "매크로 불일치"}},
+        {"macro": {"valid": True, "reason": "이제 일치"}},
+    ])
+
+    def stub_verify(question, domain_results, llm_fn):
+        per_domain = next(per_domain_by_attempt)
+        overall = all(v["valid"] for v in per_domain.values())
+        return {"valid": overall, "reason": "부분 실패" if not overall else "통과",
+                "per_domain": per_domain}
+
+    res = answer_with_verification(
+        "삼성전자 PER이랑 매크로 신호 비교", conn=None, llm_fn=None,
+        route_fn=lambda q, l: ["kr", "macro"], verify_fn=stub_verify,
+    )
+
+    assert len(kr_questions) == 1          # 통과한 kr 노드는 재실행되지 않는다
+    assert len(macro_questions) == 2       # 실패한 macro 노드만 순환 재실행
+    # 재시도 질문에는 verdict 최상위 reason이 피드백으로 주입된다(기존 계약 —
+    # test_answer_with_verification_feeds_failure_reason_into_retry와 동일 동작).
+    assert "부분 실패" in macro_questions[1]
+    assert "[이전 시도 실패 피드백]" in macro_questions[1]
+    assert res["uncertain"] is False
+    assert res["attempts"] == 2
+    assert res["domain_results"]["kr"]["stock_code"] == "005930"   # 1차 결과 보존
+
+
+def test_supervisor_graph_fanout_orders_domain_results_canonically(monkeypatch):
+    """팬아웃 병렬 병합은 LangGraph가 노드명 알파벳순으로 적용하지만, 반환되는
+    domain_results 키 순서는 기존 dispatch_domains와 동일한 정규 순서(kr→macro→backtest)로
+    유지된다(conversation._extract_tabular_data 등 순서 의존 소비자 보호)."""
+    import src.agents.supervisor as sup
+
+    monkeypatch.setattr(
+        sup, "answer_kr_question",
+        lambda question, conn, llm_fn=None, on_progress=None: {"financial": {"value": 1.0}},
+    )
+    monkeypatch.setattr(
+        sup, "answer_macro_question",
+        lambda question, conn, **k: {"available": True},
+    )
+    monkeypatch.setattr(
+        sup, "answer_backtest_question",
+        lambda question, steps, conn, llm_fn=None, on_progress=None: {"result": {"cagr": 0.1}},
+    )
+
+    res = answer_with_verification(
+        "복합 질문", conn=None, llm_fn=None,
+        route_fn=lambda q, l: ["kr", "macro", "backtest"],
+        verify_fn=lambda q, dr, l: {"valid": True, "reason": "일치"},
+    )
+
+    assert list(res["domain_results"].keys()) == ["kr", "macro", "backtest"]

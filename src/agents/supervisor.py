@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Callable
 
@@ -42,6 +44,8 @@ from src.agents.domain_backtest import answer_backtest_question
 from src.agents.domain_kr import answer_kr_question
 from src.agents.domain_macro import answer_macro_question
 from src.agents.exec_fallback import run_free_exec_fallback
+from src.agents.supervisor_graph import build_supervisor_graph, ordered_results
+from src.db import connect_readonly
 from src.llm import extract_json
 
 # 정규 도메인 순서 — LLM 응답의 순서/중복과 무관하게 항상 이 순서로 정렬해 결정론을 보장한다.
@@ -253,29 +257,59 @@ def dispatch_domains(
 
     on_progress(step, summary) 를 주면 도메인마다 조회 시작/완료(또는 오류)를 실시간
     통지한다(step=도메인 코드, 예: "kr"). 생략하면 기존과 완전히 동일하게 동작한다.
+
+    실행은 ThreadPoolExecutor로 routes 의 도메인들을 **동시에** 수행한다(순차 for 루프
+    대체). 각 도메인 스레드는 자기 전용 읽기전용 연결(connect_readonly)을 새로 열어 쓴다
+    — connect_readonly는 이미 check_same_thread=False + WAL 모드라 여러 연결이 동시에
+    읽어도 안전하다. 다만 conn 이 실제 sqlite3.Connection 이 아닌 경우(테스트가 주입하는
+    None/스텁 등)에는 새 연결을 열지 않고 받은 conn 을 그대로 넘긴다(하위호환 — 도메인
+    함수가 monkeypatch 되어 conn 을 쓰지 않는 경우 등). 반환 dict 의 키 순서는 라우팅
+    순서(routes) 그대로 유지되지만, on_progress 통지 순서는 병렬 실행이라 라우팅 순서와
+    다를 수 있다.
     """
-    results: dict = {}
-    for domain in routes:
+    _MISSING = object()  # 알 수 없는 도메인(kr/macro/backtest 외)은 결과에 담지 않기 위한 표식
+
+    def _run_domain(domain: str):
         label = _DOMAIN_LABELS_KO.get(domain, domain)
         if on_progress:
             on_progress(domain, f"{label} 도메인 조회 중…")
+        # 병렬 실행 시 도메인마다 자기 전용 읽기전용 연결을 새로 연다(동시성 안전).
+        # 실제 sqlite 연결일 때만 새로 열고, None/스텁은 그대로 통과시킨다(하위호환).
+        own_conn = None
+        domain_conn = conn
+        if isinstance(conn, sqlite3.Connection):
+            own_conn = connect_readonly()
+            domain_conn = own_conn
         domain_kwargs = {"on_progress": on_progress} if on_progress else {}
         try:
             if domain == "kr":
-                results["kr"] = answer_kr_question(question, conn, llm_fn=llm_fn, **domain_kwargs)
+                res = answer_kr_question(question, domain_conn, llm_fn=llm_fn, **domain_kwargs)
             elif domain == "macro":
-                results["macro"] = answer_macro_question(question, conn)
+                res = answer_macro_question(question, domain_conn)
             elif domain == "backtest":
-                results["backtest"] = answer_backtest_question(
-                    question, steps or [], conn, llm_fn=llm_fn, **domain_kwargs
+                res = answer_backtest_question(
+                    question, steps or [], domain_conn, llm_fn=llm_fn, **domain_kwargs
                 )
+            else:
+                res = _MISSING
             if on_progress:
                 on_progress(domain, f"{label} 도메인 완료")
+            return domain, res
         except Exception as exc:  # noqa: BLE001 — 방어적: 도메인 예외를 총괄까지 올리지 않음
-            results[domain] = {"error": f"{type(exc).__name__}: {exc}"}
             if on_progress:
                 on_progress(domain, f"{label} 도메인 오류: {exc}")
-    return results
+            return domain, {"error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            if own_conn is not None:
+                own_conn.close()
+
+    if not routes:
+        return {}
+    # executor.map 은 입력(routes) 순서대로 결과를 돌려주므로, 병렬 실행이어도 반환 dict 의
+    # 키 순서는 라우팅 순서 그대로 결정론적으로 유지된다(하위 검증/종합결론의 결정론 보장).
+    with ThreadPoolExecutor(max_workers=len(routes)) as executor:
+        pairs = list(executor.map(_run_domain, routes))
+    return {domain: res for domain, res in pairs if res is not _MISSING}
 
 
 def _domain_has_data(result: dict) -> bool:
@@ -510,35 +544,6 @@ def _truncate_for_prompt(value, head: int = _PROMPT_LIST_HEAD):
     return value
 
 
-def _finalize_success(
-    question: str, domain_results: dict, routes: list[str], attempts: int,
-    synthesize_fn: Callable, llm_fn, chart_fallback_fn: Callable, chart_llm_fn,
-) -> dict:
-    """검증 통과 시 종합결론+원본 domain_results+(요청 시)차트를 묶어 반환한다.
-
-    정형 재시도 루프의 성공 분기와 backtest 추가시도(escalation)의 성공 분기가 완전히
-    동일한 마무리 로직(synthesize+차트)을 공유하므로 헬퍼로 뽑았다 — 새 로직 추가가 아니라
-    기존 인라인 블록을 그대로 옮긴 것뿐이다(동작 변화 없음).
-    """
-    conclusion = synthesize_fn(question, domain_results, llm_fn)
-    result = {
-        "uncertain": False,
-        "conclusion": conclusion,
-        "domain_results": domain_results,
-        "attempts": attempts,
-        "routes": routes,
-    }
-    if wants_chart(question):
-        chart = chart_fallback_fn(
-            question, _chartable_payload(domain_results), chart_llm_fn or llm_fn
-        )
-        if chart:
-            b64, title = chart["chart_base64"], chart.get("chart_title")
-            result["chart_base64"], result["chart_title"] = b64, title
-            result["charts"] = [{"chart_base64": b64, "chart_title": title}]
-    return result
-
-
 def _domain_results_json_for_prompt(domain_results: dict) -> str:
     return json.dumps(_truncate_for_prompt(domain_results), ensure_ascii=False, default=str)
 
@@ -736,6 +741,13 @@ def answer_with_verification(
 ) -> dict:
     """총괄 오케스트레이션: route→dispatch→verify, 실패 시 정확히 max_retries회까지 재시도.
 
+    구현(Phase 2): 내부는 더 이상 순수 파이썬 루프가 아니라 **진짜 LangGraph 다중 노드
+    그래프**(src/agents/supervisor_graph.build_supervisor_graph — 라우터/kr/macro/backtest
+    팬아웃/검증/차트/종합결론 노드 + 검증 실패 시 실패 도메인으로만 되돌아가는 순환 엣지)를
+    빌드·실행하고, 최종 상태를 기존과 정확히 같은 모양의 dict로 변환해 반환한다. 이 함수의
+    시그니처와 반환값 계약(아래)은 그대로다 — graph.py(supervisor_node)와 conversation.py
+    (run_turn)의 기존 호출부는 무수정으로 새 그래프 기반 구현을 쓴다.
+
     흐름:
       1) route_fn(question, llm_fn) 으로 도메인 라우팅(한 번만).
       2) 최대 max_retries(기본 2)회 반복: dispatch_fn → verify_fn.
@@ -775,165 +787,61 @@ def answer_with_verification(
         {"uncertain": True, "reason": str, "attempts": max_retries,
          "domain_results": {...}, "routes": [...]}
     """
-    route_fn = route_fn or route_question
-    dispatch_fn = dispatch_fn or dispatch_domains
-    verify_fn = verify_fn or verify_answer
-    synthesize_fn = synthesize_fn or synthesize_conclusion
-    fallback_fn = fallback_fn or run_free_exec_fallback
-    chart_fallback_fn = chart_fallback_fn or build_chart_freeform
+    # 그래프 노드들이 기본 구현 대신 테스트 주입분(route_fn/dispatch_fn/...)을 쓰도록
+    # 여기서 해석해 클로저로 넘긴다 — 기존 단위테스트의 주입 계약이 그대로 유효하다.
+    # dispatch_fn 미주입(실사용 경로)이면 도메인 노드 팬아웃으로 병렬 실행하고, 주입됐으면
+    # 기존 계약("시도마다 전체 라우트로 정확히 1회 호출")대로 dispatch_gate가 배치 호출한다.
+    use_domain_fanout = dispatch_fn is None
+    graph = build_supervisor_graph(
+        conn=conn,
+        llm_fn=llm_fn,
+        max_retries=max_retries,
+        route_fn=route_fn or route_question,
+        dispatch_fn=dispatch_fn or dispatch_domains,
+        verify_fn=verify_fn or verify_answer,
+        synthesize_fn=synthesize_fn or synthesize_conclusion,
+        fallback_fn=fallback_fn or run_free_exec_fallback,
+        chart_fallback_fn=chart_fallback_fn or build_chart_freeform,
+        chart_llm_fn=chart_llm_fn,
+        wants_chart_fn=wants_chart,
+        chartable_payload_fn=_chartable_payload,
+        use_domain_fanout=use_domain_fanout,
+        steps=steps,
+        on_progress=on_progress,
+    )
+    # recursion_limit: 시도당 최대 3 superstep(gate→도메인 팬아웃→verify) × max_retries
+    # + 라우터/추가시도/폴백/재검증/종합/차트 여유분. 순환 탈출은 verify 노드의
+    # attempts/phase 상태가 보장하고, 이 상한은 이중 안전망이다.
+    final = graph.invoke(
+        {"question": question},
+        config={"recursion_limit": 3 * max_retries + 12},
+    )
 
-    # on_progress가 없으면(대부분의 기존 호출부) 하위 함수에 그 키워드 자체를 안 넘긴다 —
-    # 주입되는 fake route_fn/dispatch_fn(테스트)이 on_progress 파라미터를 몰라도 깨지지 않는다.
-    progress_kwargs = {"on_progress": on_progress} if on_progress else {}
-
-    routes = route_fn(question, llm_fn, **progress_kwargs)
-
-    if not routes:
-        # 라우팅이 도메인을 하나도 못 찾음(unknown) — dispatch/verify를 시도하는 낭비 없이
-        # 즉시 불확실 응답으로 끝낸다(완전히 무관한 질문에 억지로 도메인을 갖다붙이지 않는다).
-        if on_progress:
-            on_progress("supervisor", "질문을 이해하지 못했습니다 — 처리 가능한 도메인을 찾지 못함")
+    # 그래프 최종 상태 → 기존과 정확히 같은 모양의 반환 dict(키 존재/부재까지 동일).
+    domain_results = ordered_results(final.get("domain_results") or {}, use_domain_fanout)
+    routes = final.get("routes") or []
+    attempts = final.get("attempts") or 0
+    if final.get("uncertain"):
         return {
             "uncertain": True,
-            "reason": "질문을 이해하지 못했습니다. 국내 주식, 매크로 지표, 백테스트 중 "
-                      "어떤 것에 대한 질문인지 좀 더 구체적으로 말씀해 주세요.",
-            "attempts": 0,
-            "domain_results": {},
-            "routes": [],
-        }
-
-    domain_results: dict = {}
-    last_reason: str | None = None
-    attempts = 0
-    routes_to_dispatch = list(routes)  # 1차는 전체, 이후 실패한 도메인만(부분 재시도)
-    for attempt in range(1, max_retries + 1):
-        attempts = attempt
-        # 재시도(2회차부터)에는 직전 실패 사유를 도메인 실행 질문에 피드백으로 덧붙인다.
-        # 안 붙이면 도메인 에이전트(LLM)가 매 시도마다 완전히 동일한 접근을 반복해 검증에
-        # 또 실패하고 토큰만 낭비한다(실사용 재현: "직전 12개월 수익률" 질문에 매번 똑같이
-        # revenue_growth로 잘못 스크리닝). 검증(verify_fn)/종합결론(synthesize_fn)에는
-        # 피드백이 섞이지 않은 원본 question을 그대로 넘겨 판정 자체가 왜곡되지 않게 한다.
-        dispatch_question = question
-        if last_reason:
-            dispatch_question = (
-                f"{question}\n\n"
-                f"[이전 시도 실패 피드백] 직전 시도가 다음 이유로 검증에 실패했습니다: {last_reason}\n"
-                f"같은 방식을 그대로 반복하지 말고, 이 피드백을 반영해 다른 접근으로 다시 답하세요."
-            )
-        new_results = dispatch_fn(
-            routes_to_dispatch, dispatch_question, conn, llm_fn, steps=steps, **progress_kwargs
-        )
-        # 부분 재시도 시 이전에 검증 통과한 도메인 결과는 그대로 유지하고, 이번에 (재)실행한
-        # 도메인만 덮어쓴다(update). 1차 시도는 routes_to_dispatch가 전체이므로 기존과 동일.
-        domain_results.update(new_results)
-        verdict = verify_fn(question, domain_results, llm_fn)
-        if verdict.get("valid"):
-            if on_progress:
-                on_progress("verify", f"{attempt}차 검증 통과")
-            # 명시적 차트 요청("그래프/차트/그려줘" 등)이 원본 question에 있을 때만 이미지 차트를
-            # 붙인다(모든 질문에 자동으로 붙이지 않음). 차트 종류 판정은 결정론적 패턴매칭 없이
-            # 전적으로 LLM(chart_fallback_fn=build_chart_freeform)에 위임한다 — matplotlib 전체에서
-            # 질문·데이터에 맞는 종류를 자유롭게 고른다. (옛 결정론 경로가 숫자 필드 1개짜리
-            # 스크리닝 결과에서 같은 필드를 x·y에 둘 다 배정해 "pbr vs pbr 산점도"를 그리던 오판이
-            # 이 구조 변경으로 근본 소거된다.) 차트 판단용 LLM은 chart_llm_fn(기본=llm_fn; web가
-            # 저가 role="chart"로 별도 주입 가능)이 맡는다. llm_fn 미가용/코드생성·실행 실패 시
-            # None → 차트 없이 텍스트 응답만(부가 기능이라 본문 응답을 절대 무너뜨리지 않는다).
-            return _finalize_success(
-                question, domain_results, routes, attempt,
-                synthesize_fn, llm_fn, chart_fallback_fn, chart_llm_fn,
-            )
-        last_reason = verdict.get("reason")
-        per_domain = verdict.get("per_domain") or {}
-        if per_domain:
-            routes_to_dispatch = [d for d in routes if not per_domain.get(d, {}).get("valid", False)]
-        else:
-            routes_to_dispatch = list(routes)  # per_domain 정보 없는 verify_fn 하위호환
-        if on_progress:
-            suffix = " → 재시도" if attempt < max_retries else ""
-            on_progress("verify", f"{attempt}차 검증 실패: {last_reason}{suffix}")
-
-    # 정형 검증 루프가 모두 실패했고, 원래 라우팅에 backtest가 없었다면 — kr처럼 "구간별
-    # 집계" 같은 표현력이 없는 도메인은 피드백을 아무리 줘도 같은 종류의 답만 반복하므로,
-    # free_exec(자유 코드 생성)으로 넘어가기 전에 backtest를 한 번 더 시도한다(정확히 1회,
-    # 무한루프 없음 — 라우팅이 이미 backtest를 포함했다면 중복 시도하지 않는다. 실사용
-    # 재현: "PER 10구간 평균"이 라우팅 실수로 kr에만 갔던 문제의 안전망).
-    if "backtest" not in routes:
-        if on_progress:
-            on_progress(
-                "supervisor", f"{max_retries}회 정형 검증 실패 → backtest 도메인 추가시도",
-            )
-        escalation_results = dispatch_fn(
-            ["backtest"], question, conn, llm_fn, steps=steps, **progress_kwargs
-        )
-        domain_results.update(escalation_results)
-        verdict = verify_fn(question, domain_results, llm_fn)
-        if verdict.get("valid"):
-            if on_progress:
-                on_progress("verify", "backtest 추가시도 검증 통과")
-            result = _finalize_success(
-                question, domain_results, routes + ["backtest"], attempts,
-                synthesize_fn, llm_fn, chart_fallback_fn, chart_llm_fn,
-            )
-            result["used_backtest_escalation"] = True
-            return result
-        last_reason = verdict.get("reason")
-        if on_progress:
-            on_progress("verify", f"backtest 추가시도도 검증 실패: {last_reason}")
-
-    # 정형 검증 루프가 모두 실패 — 정형 어휘의 표현력 한계일 수 있으므로 마지막으로 딱 1회,
-    # LLM이 SQL+Python을 직접 작성하는 자유 실행 폴백을 시도한다(재시도 루프와 무관, 검증도
-    # 다시 거치지 않음 — 그러면 같은 이유로 다시 실패해 무한루프에 가까워진다).
-    fallback = fallback_fn(question, conn, llm_fn, last_reason)
-    if fallback.get("ok"):
-        if on_progress:
-            on_progress(
-                "supervisor", f"{max_retries}회 정형 검증 실패 → 자유 코드 생성 폴백 성공",
-            )
-        domain_results["free_exec"] = {
-            "fallback_used": True,
-            "sql": fallback.get("sql"),
-            "code": fallback.get("code"),
-            "result": fallback.get("result"),
-        }
-        # 재검증 안전망: 폴백 자체는 재시도하지 않는다(무한루프 방지 원칙 유지 — fallback_fn은
-        # 위에서 이미 정확히 1회만 호출됐다). 다만 검증을 아예 안 거치면, 정형 어휘 한계로
-        # 실패한 게 아니라 폴백이 스스로 질문을 잘못 이해한 경우(예: "PER z-score 히스토그램"을
-        # z-score 없이 원본 PER로만 답함)까지 조용히 "정상 답변"으로 나갈 수 있다. 실패해도
-        # 이 결과를 버리지는 않고(최후 수단이라 버리면 대안이 없다) 사유만 남겨, 최종 답변에
-        # 신뢰도 유보 문구를 붙일 근거를 synthesize_fn에 제공한다.
-        fallback_verdict = verify_fn(question, domain_results, llm_fn)
-        if not fallback_verdict.get("valid"):
-            domain_results["free_exec"]["verification_warning"] = fallback_verdict.get("reason")
-            if on_progress:
-                on_progress(
-                    "verify",
-                    f"자유 코드 폴백 결과 재검증 실패(참고용으로 표시): {fallback_verdict.get('reason')}",
-                )
-        elif on_progress:
-            on_progress("verify", "자유 코드 폴백 결과 재검증 통과")
-        conclusion = synthesize_fn(question, domain_results, llm_fn)
-        return {
-            "uncertain": False,
-            "conclusion": conclusion,
-            "domain_results": domain_results,
+            "reason": final.get("reason"),
             "attempts": attempts,
+            "domain_results": domain_results,
             "routes": routes,
-            "used_fallback": True,
         }
-    if on_progress:
-        on_progress(
-            "supervisor",
-            f"{max_retries}회 정형 검증 실패 → 자유 코드 생성 폴백도 실패: {fallback.get('error')}",
-        )
-
-    return {
-        "uncertain": True,
-        "reason": (
-            f"{max_retries}회 검증에 모두 실패했습니다. 확실한 답을 제시할 수 없습니다."
-            + (f" (마지막 사유: {last_reason})" if last_reason else "")
-            + (f" (자유 코드 생성 폴백도 실패: {fallback.get('error')})" if fallback.get("error") else "")
-        ),
-        "attempts": attempts,
+    result = {
+        "uncertain": False,
+        "conclusion": final.get("conclusion"),
         "domain_results": domain_results,
-        "routes": routes,
+        "attempts": attempts,
+        "routes": final.get("final_routes") or routes,
     }
+    if final.get("charts") is not None:
+        result["chart_base64"] = final.get("chart_base64")
+        result["chart_title"] = final.get("chart_title")
+        result["charts"] = final.get("charts")
+    if final.get("used_backtest_escalation"):
+        result["used_backtest_escalation"] = True
+    if final.get("used_fallback"):
+        result["used_fallback"] = True
+    return result

@@ -2203,6 +2203,61 @@ def test_parse_price_target_date_invalid_calendar_date_is_none():
     ) is None
 
 
+# ── _parse_price_target_date: LLM 우선 판단 (실서버 재현 버그) ────────────────────
+# "하이닉스 25년 3분기 영업이익과 26년 7월 24일 종가"처럼 한 질문에 서로 다른 목적의
+# 연도가 두 번 나오면, 정규식은 문장에서 먼저 나오는 "25년"을 집어(재무용 연도인데도)
+# "7월 24일"과 잘못 짝지어 2025-07-24를 반환했다(정확히 1년 어긋남). LLM에게 먼저
+# 물어보면 문맥으로 "26년"이 "7월 24일"의 연도임을 정확히 판단할 수 있다.
+def test_parse_price_target_date_llm_resolves_correct_year_when_two_years_present():
+    fake_llm = lambda prompt: "2026-07-24"
+    assert _parse_price_target_date(
+        "하이닉스 25년 3분기 영업이익과 26년 7월 24일 종가",
+        today=date(2026, 7, 24),
+        llm_fn=fake_llm,
+    ) == "2026-07-24"
+
+
+def test_parse_price_target_date_llm_none_response_falls_back_to_regex():
+    # LLM이 "가격 조회용 특정 날짜 없음"이라고 명시적으로 답해도, 정규식이 실제로
+    # 월-일을 찾으면(폴백 규칙) 기존 동작을 그대로 유지한다.
+    fake_llm = lambda prompt: "NONE"
+    assert _parse_price_target_date(
+        "삼성전자 25년 6월 18일 종가", today=date(2026, 7, 20), llm_fn=fake_llm
+    ) == "2025-06-18"
+
+
+def test_parse_price_target_date_llm_unparseable_response_falls_back_to_regex():
+    fake_llm = lambda prompt: "잘 모르겠어요"
+    assert _parse_price_target_date(
+        "삼성전자 25년 6월 18일 종가", today=date(2026, 7, 20), llm_fn=fake_llm
+    ) == "2025-06-18"
+
+
+def test_parse_price_target_date_llm_exception_falls_back_to_regex():
+    def boom(prompt):
+        raise RuntimeError("LLM 호출 실패")
+
+    assert _parse_price_target_date(
+        "삼성전자 25년 6월 18일 종가", today=date(2026, 7, 20), llm_fn=boom
+    ) == "2025-06-18"
+
+
+def test_parse_price_target_date_llm_invalid_calendar_date_falls_back_to_regex():
+    # LLM이 존재하지 않는 날짜(2026-02-30)를 잘못 답해도 그 값을 그대로 쓰지 않고
+    # 정규식 폴백으로 넘어간다(달력 검증은 LLM 응답에도 동일하게 적용).
+    fake_llm = lambda prompt: "2026-02-30"
+    assert _parse_price_target_date(
+        "삼성전자 25년 6월 18일 종가", today=date(2026, 7, 20), llm_fn=fake_llm
+    ) == "2025-06-18"
+
+
+def test_parse_price_target_date_no_llm_fn_unchanged():
+    # llm_fn을 안 주면(기본 None) 기존 정규식 전용 경로와 완전히 동일하게 동작한다(회귀 없음).
+    assert _parse_price_target_date(
+        "하이닉스 6월 18일 주가정보 알려줘", today=date(2026, 7, 20)
+    ) == "2026-06-18"
+
+
 def _seed_price_dates(tmp_path, code: str, name: str, rows: list[tuple[str, float]]) -> str:
     """단일종목의 (date, close) 여러 건을 시드한 임시 DB 경로를 반환(특정일자 조회 테스트용)."""
     db = tmp_path / "price_dates.db"
