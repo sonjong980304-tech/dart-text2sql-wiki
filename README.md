@@ -219,8 +219,6 @@ vision 판정과 대조하였습니다.
 #### 노드별 — LangGraph 그래프 구조
 현재(신규) 계층형 그래프(`src/agents/graph.py`)는 **의도적으로 노드가 하나**입니다: `START → supervisor → END`. 라우팅·도메인실행·검증·재시도는 전부 이 `supervisor` 노드 **안에서** `answer_with_verification` 함수 호출로 처리됩니다(도메인마다 그래프 노드를 쪼개지 않음 — 스트리밍 이벤트가 노드 완료 시점마다 나오면 충분했기 때문). `.stream()`으로 실행해 노드가 끝날 때마다 `{"step": "supervisor", "summary": "..."}` 진행 이벤트를 방출하고, `run_streaming`이 이걸 별도 스레드+큐로 실시간화해 SSE로 흘려보냅니다.
 
-</details>
-
 ---
 
 ## 아키텍처 심층
@@ -411,14 +409,11 @@ quant-assistant/
 └── scripts/                   # 데이터 수집/백필/launchd 진입점
 ```
 
-</details>
 
 ---
 
 ## 데이터 정합성과 품질 안전장치
 
-<details>
-<summary>펼쳐서 보기 — 재무제표 정정공시, 관리종목 이력, 시가총액·가격 이상치 가드, 거래세율</summary>
 
 ### 데이터 정합성 — 한국 시장 데이터를 어떻게 정확하게 만들었나
 
@@ -449,7 +444,6 @@ quant-assistant/
 - **무엇/왜**: 매도 거래세율은 해가 바뀌며 인하돼 왔고 코스피/코스닥이 서로 다른데, 과거 백테스트 비용을 단일 현재세율로 계산하면 부정확합니다.
 - **어떻게**: 과거 실제 세율을 1차 출처로 검증해 `references/securities_transaction_tax_rate_history.md`에 연도별로 문서화했습니다. **아직 백테스트 비용 계산 코드에는 배선하지 않았습니다(예정)** — 현재 백테스트는 단일 `tax_rate` 파라미터를 씁니다.
 
-</details>
 
 ---
 
@@ -552,8 +546,6 @@ quant_trader와 동일한 텔레그램 채널로 알림 발송(직전 달 대비
 
 ## 데이터와 API 레퍼런스
 
-<details>
-<summary>펼쳐서 보기 — 테이블 스키마, 데이터 출처, 자동 갱신, API 목록, 키 발급, 평가</summary>
 
 ### 데이터 (SQLite, `data/market.db`)
 
