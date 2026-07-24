@@ -271,8 +271,8 @@ CREATE TABLE IF NOT EXISTS kr_stock_changes (
 -- kr_trading_status 와 동일한 구간+멱등 upsert 사상 — 한 종목이 지정→해제→재지정을
 -- 반복하면 여러 행(각 구간 1행). UNIQUE(stock_code, status_type, start_date) 로 재수집 멱등이고,
 -- 열린 구간(end_date NULL)이 나중에 해제 공시로 닫히면 그 행의 end_date 만 갱신한다.
--- ⚠️ 이번 스코프에선 backtest(data_access asof)에 연결하지 않는다 — 데이터 품질을 사용자가 검증한
--- 뒤 별도로 연결 여부를 결정한다. 자연어 SQL 질의 대상 아님(QUERYABLE_TABLES 미포함).
+-- backtest(data_access._admin_halt_status_at, auditor.post_audit)에 연결돼 있다 — asof 시점
+-- 관리종목/매매거래정지 판정에 실제로 쓰인다. 자연어 SQL 질의 대상 아님(QUERYABLE_TABLES 미포함).
 CREATE TABLE IF NOT EXISTS kr_admin_status_history (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     stock_code      TEXT NOT NULL,   -- 종목코드 (6자리 단축코드)
